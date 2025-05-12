@@ -8,7 +8,7 @@ import (
     "os"
     "strconv"
     "strings"
-
+    "regexp"
     "github.com/gin-gonic/gin"
     _ "github.com/marcboeker/go-duckdb"
 )
