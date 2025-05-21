@@ -22,26 +22,43 @@ func main() {
     router.GET("/healthcheck", healthCheckHandler)
     router.GET("/cancer_types", makeHandler("SELECT * FROM cancer_types"))
     router.GET("/donor_data", makeHandler("SELECT * FROM donor_data"))
+    router.GET("/exomes_donor_data", makeHandler("SELECT * FROM exome_donor_data"))
+
     router.GET("/tcga_survival_data", makeHandler("SELECT * FROM tcga_survival_data"))
 
+    // Neomers
     router.GET("/get_nullomers", getNullomersHandler)
     router.GET("/get_suggestions", getSuggestionsHandler)
     router.GET("/get_nullomers_stats", getNullomersStatsHandler)
 
-    router.GET("/get_exomes", getExomesHandler)
-    router.GET("/get_exomes_stats", getExomesStatsHandler)
+    // Exomes
+    router.GET("/get_exome_nullomers",   getExomeNullomersHandler)
+    router.GET("/get_exome_suggestions", getExomeSuggestionsHandler)
+    router.GET("/get_exome_nullomers_stats", getExomeNullomersStatsHandler)
 
+    // Patient Details
     router.GET("/patient_details", getPatientDetailsHandler)
     router.GET("/patient_neomers", getPatientNeomersHandler)
     router.GET("/analyze_neomer", analyzeNeomerHandler)
+    
+
 
     router.GET("/jaccard_index", getJaccardIndexHandler)
     router.GET("/jaccard_index_organs", getJaccardIndexOrgansHandler)
 
     router.GET("/dataset_stats_cancer_types_varying_k", getDatasetStatsCancerTypesVaryingKHandler)
+    
+    router.GET("/distribution_neomer_16/cancer_types", getDistNeomer16CancerTypes)
+    router.GET("/distribution_neomer_16", getDistNeomer16Data)
+    router.GET("/distribution_neomer_16/organs", getDistNeomer16Organ)
+    router.GET("/distribution_neomer_16_organs", getDistNeomer16DataOrgans)
+    
+    router.GET("/exome_patient_details", getExomePatientDetailsHandler)
+    router.GET("/exome_patient_neomers",  getExomePatientNeomersHandler)
+    router.GET("/exome_analyze_neomer", getExomeAnalyzeNeomerHandler )
 
 
-
+    
     if err := router.Run(); err != nil {
         log.Fatalf("Failed to run server: %v", err)
     }
@@ -125,57 +142,65 @@ func getDatabasePath() string {
 }
 
 // ------------------------------------------------------------------
+// removeParentheses helper function
+// ------------------------------------------------------------------
+func removeParentheses(input string) string {
+    re := regexp.MustCompile(`[()]`) // Matches ( and )
+    return re.ReplaceAllString(input, "")
+}
+
+
+// ------------------------------------------------------------------
 // getNullomersHandler
 // ------------------------------------------------------------------
-//
 // Returns *all* columns from neomers_%s plus all columns from 
 // cancer_type_details plus donor_data, plus an added column "gc_content."
 //
+// getNullomersHandler serves paginated nullomer records with support for “between” (AF-range) filters.
 func getNullomersHandler(c *gin.Context) {
     length := c.Query("length")
-
     if length == "" {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'length'"})
         return
     }
 
-    // Pagination
+    // Pagination params
     pageStr := c.Query("page")
     limitStr := c.Query("limit")
-    filters := c.Query("filters")         // e.g. "(gc_content > 10) AND (gc_content < 50)"
+    filters := c.Query("filters")             // e.g. "(gc_content > 10) AND (gc_content < 50)"
     specialFilters := c.Query("specialFilters") // e.g. "at_least_X_distinct_patients;3"
 
+    // NEW: single “between” filter
+    column := c.Query("column")       // e.g. "AF"
+    filterType := c.Query("filterType") // should be "between"
+    filterValue := c.Query("value")     // e.g. "0.10,0.50"
+
+    // Default paging
     page := 0
     limit := 10000
-    if pageStr != "" {
-        if p, err := strconv.Atoi(pageStr); err == nil && p >= 0 {
-            page = p
-        }
+    if p, err := strconv.Atoi(pageStr); err == nil && p >= 0 {
+        page = p
     }
-    if limitStr != "" {
-        if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 10000 {
-            limit = l
-        }
+    if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 10000 {
+        limit = l
     }
 
-
-    dbPath := getDatabasePath()
-
-    db, err := sql.Open("duckdb", dbPath)
+    db, err := sql.Open("duckdb", getDatabasePath())
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer db.Close()
 
-    // 1) Base CTE returning *all* columns from the three tables, plus computed gc_content
+    // 1) Base CTE
     baseQuery := fmt.Sprintf(`
         WITH base AS (
             SELECT
                 n.* EXCLUDE (Donor_ID),
                 c.*,
                 d.*,
-                di.Tumor_Sample_Barcode, di.Matched_Norm_Sample_Barcode,
+                di.Tumor_Sample_Barcode,
+                di.Matched_Norm_Sample_Barcode,
                 ROUND(
                     100.0 * (
                         LENGTH(n.nullomers_created)
@@ -187,51 +212,59 @@ func getNullomersHandler(c *gin.Context) {
             FROM neomers_%[1]s n
             JOIN cancer_type_details c USING (Project_Code)
             LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id        )
+            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
+        )
         SELECT * FROM base
     `, length)
 
-         // Build WHERE Clause
-         whereClauses := []string{}
-         if filters != "" {
-             filterConditions := strings.Split(filters, " AND ") // Split individual filter conditions
-             for _, condition := range filterConditions {
-                 parts := strings.Fields(condition) // Split by space
-                 if len(parts) >= 3 {
-                     column := cleanColumnName(parts[0]) // Ensure column name is cleaned properly
-                     if isNumericColumn(column) {
-                         condition = fmt.Sprintf(`CAST("%s" AS FLOAT) %s %s`, column, parts[1], removeParentheses(parts[2]))
-                     }
-         
-                     whereClauses = append(whereClauses, condition)
-                 }
-             }
-         }
+    // Build WHERE clauses
+    var whereClauses []string
 
-    // Special filters (like at_least_X_distinct_patients)
+    // a) “Between” filter for AF* columns
+    if filterType == "between" && column != "" && filterValue != "" {
+        parts := strings.Split(filterValue, ",")
+        if len(parts) == 2 {
+            minVal := parts[0]
+            maxVal := parts[1]
+            whereClauses = append(whereClauses,
+                fmt.Sprintf(
+                    `CAST("%s" AS FLOAT) >= %s AND CAST("%s" AS FLOAT) <= %s`,
+                    column, minVal, column, maxVal,
+                ),
+            )
+        }
+    } else if filters != "" {
+        // b) Legacy “filters” param
+        for _, cond := range strings.Split(filters, " AND ") {
+            parts := strings.Fields(cond)
+            if len(parts) >= 3 {
+                col := cleanColumnName(parts[0])
+                if isNumericColumn(col) {
+                    cond = fmt.Sprintf(`CAST("%s" AS FLOAT) %s %s`,
+                        col, parts[1], removeParentheses(parts[2]))
+                }
+                whereClauses = append(whereClauses, cond)
+            }
+        }
+    }
+
+    // c) Special filters (e.g. at_least_X_distinct_patients)
     if specialFilters != "" {
-        parts := strings.Split(specialFilters, "|")
-        for _, part := range parts {
-            sfPieces := strings.Split(part, ";")
-            switch sfPieces[0] {
-            case "at_least_X_distinct_patients":
-                if len(sfPieces) == 2 {
-                    distinctStr := sfPieces[1]
-                    distinctCount, err := strconv.Atoi(distinctStr)
-                    if err == nil && distinctCount > 0 {
-                        subQuery := fmt.Sprintf(`
-                            nullomers_created IN (
-                                SELECT nullomers_created
-                                FROM neomers_%[1]s
-                                JOIN cancer_type_details USING (Project_Code)
-                                LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-                                LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id)   
-                                GROUP BY nullomers_created
-                                HAVING COUNT(DISTINCT donor_id) >= %d
-                            )
-                        `, length, distinctCount)
-                        whereClauses = append(whereClauses, subQuery)
-                    }
+        for _, part := range strings.Split(specialFilters, "|") {
+            sf := strings.Split(part, ";")
+            if sf[0] == "at_least_X_distinct_patients" && len(sf) == 2 {
+                if n, err := strconv.Atoi(sf[1]); err == nil && n > 0 {
+                    sub := fmt.Sprintf(`
+                        nullomers_created IN (
+                            SELECT nullomers_created
+                            FROM neomers_%[1]s
+                            JOIN cancer_type_details USING (Project_Code)
+                            LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+                            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
+                            GROUP BY nullomers_created
+                            HAVING COUNT(DISTINCT donor_id) >= %d
+                        )`, length, n)
+                    whereClauses = append(whereClauses, sub)
                 }
             }
         }
@@ -240,11 +273,10 @@ func getNullomersHandler(c *gin.Context) {
     finalWhere := ""
     if len(whereClauses) > 0 {
         finalWhere = " WHERE " + strings.Join(whereClauses, " AND ")
-    }    
+    }
     fmt.Println("🔍  finalWhere", finalWhere)
 
-
-    // 2) COUNT query with same CTE
+    // 2) COUNT
     countQuery := fmt.Sprintf(`
         WITH base AS (
             SELECT
@@ -262,68 +294,62 @@ func getNullomersHandler(c *gin.Context) {
             FROM neomers_%[1]s n
             JOIN cancer_type_details c USING (Project_Code)
             LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id        )        
+            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
+        )
         SELECT COUNT(*) FROM base
         %s
     `, length, finalWhere)
 
     var totalCount int
-    err = db.QueryRow(countQuery).Scan(&totalCount)
-    if err != nil {
+    if err := db.QueryRow(countQuery).Scan(&totalCount); err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
 
-    // 3) Final query with LIMIT/OFFSET
+    // 3) Data page
     offset := page * limit
-    query := fmt.Sprintf("%s %s LIMIT %d OFFSET %d", baseQuery, finalWhere, limit, offset)
-
-    rows, err := db.Query(query)
+    pageQuery := fmt.Sprintf("%s %s LIMIT %d OFFSET %d", baseQuery, finalWhere, limit, offset)
+    rows, err := db.Query(pageQuery)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer rows.Close()
 
-    columns, err := rows.Columns()
+    cols, err := rows.Columns()
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
 
-    data := make([][]interface{}, 0)
+    var data [][]interface{}
     for rows.Next() {
-        row := make([]interface{}, len(columns))
-        rowPointers := make([]interface{}, len(columns))
+        row := make([]interface{}, len(cols))
+        ptrs := make([]interface{}, len(cols))
         for i := range row {
-            rowPointers[i] = &row[i]
+            ptrs[i] = &row[i]
         }
-
-        if err := rows.Scan(rowPointers...); err != nil {
+        if err := rows.Scan(ptrs...); err != nil {
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
             return
         }
-
-        // Convert []byte -> string, handle NULL
-        for i, val := range row {
-            if b, ok := val.([]byte); ok {
+        for i, v := range row {
+            if b, ok := v.([]byte); ok {
                 row[i] = string(b)
             }
-            if val == nil {
+            if v == nil {
                 row[i] = nil
             }
         }
         data = append(data, row)
     }
 
-    result := map[string]interface{}{
-        "headers":    columns,
+    c.JSON(http.StatusOK, gin.H{
+        "headers":    cols,
         "data":       data,
         "totalCount": totalCount,
-    }
-    c.JSON(http.StatusOK, result)
+    })
 }
-
 // ------------------------------------------------------------------
 // cleanColumnName helper function
 // ------------------------------------------------------------------
@@ -371,7 +397,7 @@ func isNumericColumn(column string) bool {
 func getSuggestionsHandler(c *gin.Context) {
     column := c.Query("column")
     input := c.Query("input")
-    filterType := c.Query("filterType")
+    // filterType := c.Query("filterType")
     length := c.Query("length")
     if length == "" {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing length"})
@@ -379,7 +405,7 @@ func getSuggestionsHandler(c *gin.Context) {
     }
 
     // If user tries to get suggestions for numeric columns like gc_content,
-    // we can skip. Or return nothing, as below:
+    // we typically skip. But do as you wish:
     if column == "gc_content" {
         c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
         return
@@ -398,25 +424,14 @@ func getSuggestionsHandler(c *gin.Context) {
     if lowerInput == "" {
         cond = ""
     } else {
-        switch filterType {
-        case "contains":
-            cond = fmt.Sprintf("WHERE LOWER(%s) LIKE '%%%s%%'", column, lowerInput)
-        case "ends":
-            cond = fmt.Sprintf("WHERE LOWER(%s) LIKE '%%%s'", column, lowerInput)
-        default:
-            // e.g. "starts", etc.
-            cond = fmt.Sprintf("WHERE LOWER(%s) LIKE '%s%%'", column, lowerInput)
-        }
+        cond = fmt.Sprintf("WHERE LOWER(%s) LIKE '%%%s%%'", column, lowerInput)
     }
 
-    // Join with donor_data using the same pattern:
     query := fmt.Sprintf(`
         WITH base AS (
             SELECT DISTINCT %s
-            FROM neomers_%s n
-            JOIN cancer_type_details c USING (Project_Code)
-            LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id)   
+            FROM nullomers_%s
+            JOIN cancer_type_details USING (Project_Code)
             %s
             LIMIT 10
         )
@@ -427,7 +442,6 @@ func getSuggestionsHandler(c *gin.Context) {
 
     rows, err := db.Query(query)
     if err != nil {
-        // Not necessarily an error, could be no suggestions
         c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
         return
     }
@@ -452,42 +466,42 @@ func getSuggestionsHandler(c *gin.Context) {
 // ------------------------------------------------------------------
 func getNullomersStatsHandler(c *gin.Context) {
     length := c.Query("length")
-
     if length == "" {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'length'"})
         return
     }
 
     filters := c.Query("filters")
+    specialFilters := c.Query("specialFilters")
     groupByStr := c.Query("groupBy")
     topNStr := c.Query("topN")
-    specialFilters := c.Query("specialFilters")
-    log.Printf("Received length: %s", length)
 
+    // NEW: single “between” filter
+    column := c.Query("column")
+    filterType := c.Query("filterType")
+    filterValue := c.Query("value")
 
     topN := 10
-    if topNStr != "" {
-        if val, err := strconv.Atoi(topNStr); err == nil && val > 0 {
-            topN = val
-        }
+    if n, err := strconv.Atoi(topNStr); err == nil && n > 0 {
+        topN = n
     }
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
+    db, err := sql.Open("duckdb", getDatabasePath())
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer db.Close()
 
-    // We'll keep all columns from all three tables, plus negative GC content
+    // Base CTE
     baseCTE := fmt.Sprintf(`
         WITH base AS (
             SELECT
                 n.* EXCLUDE (Donor_ID),
                 c.*,
                 d.*,
-                di.Tumor_Sample_Barcode, di.Matched_Norm_Sample_Barcode,
+                di.Tumor_Sample_Barcode,
+                di.Matched_Norm_Sample_Barcode,
                 ROUND(
                     100.0 * (
                         LENGTH(n.nullomers_created)
@@ -499,49 +513,58 @@ func getNullomersStatsHandler(c *gin.Context) {
             FROM neomers_%[1]s n
             JOIN cancer_type_details c USING (Project_Code)
             LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id)           
+            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
+        )
     `, length)
 
-      // Build WHERE Clause
-         whereClauses := []string{}
-         if filters != "" {
-             filterConditions := strings.Split(filters, " AND ") // Split individual filter conditions
-             for _, condition := range filterConditions {
-                 parts := strings.Fields(condition) // Split by space
-                 if len(parts) >= 3 {
-                     column := cleanColumnName(parts[0]) // Ensure column name is cleaned properly
-                     if isNumericColumn(column) {
-                         condition = fmt.Sprintf(`CAST("%s" AS FLOAT) %s %s`, column, parts[1], removeParentheses(parts[2]))
-                     }
-         
-                     whereClauses = append(whereClauses, condition)
-                 }
-             }
-         }
+    // Build WHERE clauses
+    var whereClauses []string
 
+    // a) “Between” filter
+    if filterType == "between" && column != "" && filterValue != "" {
+        parts := strings.Split(filterValue, ",")
+        if len(parts) == 2 {
+            minVal := parts[0]
+            maxVal := parts[1]
+            whereClauses = append(whereClauses,
+                fmt.Sprintf(
+                    `CAST("%s" AS FLOAT) >= %s AND CAST("%s" AS FLOAT) <= %s`,
+                    column, minVal, column, maxVal,
+                ),
+            )
+        }
+    } else if filters != "" {
+        // b) Legacy filters
+        for _, cond := range strings.Split(filters, " AND ") {
+            parts := strings.Fields(cond)
+            if len(parts) >= 3 {
+                col := cleanColumnName(parts[0])
+                if isNumericColumn(col) {
+                    cond = fmt.Sprintf(`CAST("%s" AS FLOAT) %s %s`,
+                        col, parts[1], removeParentheses(parts[2]))
+                }
+                whereClauses = append(whereClauses, cond)
+            }
+        }
+    }
+
+    // c) Special filters
     if specialFilters != "" {
-        parts := strings.Split(specialFilters, "|")
-        for _, part := range parts {
-            sfPieces := strings.Split(part, ";")
-            switch sfPieces[0] {
-            case "at_least_X_distinct_patients":
-                if len(sfPieces) == 2 {
-                    distinctStr := sfPieces[1]
-                    distinctCount, err := strconv.Atoi(distinctStr)
-                    if err == nil && distinctCount > 0 {
-                        subQuery := fmt.Sprintf(`
-                            nullomers_created IN (
-                                SELECT nullomers_created
-                                FROM neomers_%[1]s
-                                JOIN cancer_type_details USING (Project_Code)
-                                LEFT JOIN exomes_donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-                                LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
-                                GROUP BY nullomers_created
-                                HAVING COUNT(DISTINCT donor_id) >= %d
-                            )
-                        `, length, distinctCount)
-                        whereClauses = append(whereClauses, subQuery)
-                    }
+        for _, part := range strings.Split(specialFilters, "|") {
+            sf := strings.Split(part, ";")
+            if sf[0] == "at_least_X_distinct_patients" && len(sf) == 2 {
+                if n, err := strconv.Atoi(sf[1]); err == nil && n > 0 {
+                    sub := fmt.Sprintf(`
+                        nullomers_created IN (
+                            SELECT nullomers_created
+                            FROM neomers_%[1]s
+                            JOIN cancer_type_details USING (Project_Code)
+                            LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+                            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
+                            GROUP BY nullomers_created
+                            HAVING COUNT(DISTINCT donor_id) >= %d
+                        )`, length, n)
+                    whereClauses = append(whereClauses, sub)
                 }
             }
         }
@@ -552,13 +575,11 @@ func getNullomersStatsHandler(c *gin.Context) {
         finalWhere = " WHERE " + strings.Join(whereClauses, " AND ")
     }
 
-    // Figure out groupBy
+    // Prepare GROUP BY
     groupByCols := []string{"nullomers_created"}
     selectCols := []string{"nullomers_created"}
-
     if groupByStr != "" {
-        additional := strings.Split(groupByStr, ",")
-        for _, col := range additional {
+        for _, col := range strings.Split(groupByStr, ",") {
             col = strings.TrimSpace(col)
             if col != "" {
                 groupByCols = append(groupByCols, col)
@@ -566,11 +587,10 @@ func getNullomersStatsHandler(c *gin.Context) {
             }
         }
     }
-
     selectClause := strings.Join(selectCols, ", ")
     groupByClause := strings.Join(groupByCols, ", ")
 
-    // Build final stats query
+    // Final stats query
     query := fmt.Sprintf(`
         %s
         SELECT
@@ -590,362 +610,324 @@ func getNullomersStatsHandler(c *gin.Context) {
     }
     defer rows.Close()
 
-    columns, err := rows.Columns()
+    cols, err := rows.Columns()
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
 
-    data := make([][]interface{}, 0)
+    var data [][]interface{}
     for rows.Next() {
-        row := make([]interface{}, len(columns))
-        rowPointers := make([]interface{}, len(columns))
+        row := make([]interface{}, len(cols))
+        ptrs := make([]interface{}, len(cols))
         for i := range row {
-            rowPointers[i] = &row[i]
+            ptrs[i] = &row[i]
         }
-        if err := rows.Scan(rowPointers...); err != nil {
+        if err := rows.Scan(ptrs...); err != nil {
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
             return
         }
-
-        for i, val := range row {
-            if b, ok := val.([]byte); ok {
+        for i, v := range row {
+            if b, ok := v.([]byte); ok {
                 row[i] = string(b)
             }
-            if val == nil {
+            if v == nil {
                 row[i] = nil
             }
         }
         data = append(data, row)
     }
 
-    result := map[string]interface{}{
-        "headers": columns,
+    c.JSON(http.StatusOK, gin.H{
+        "headers": cols,
         "data":    data,
-    }
-    c.JSON(http.StatusOK, result)
+    })
 }
 
-// ------------------------------------------------------------------
-// getExomesHandler
-// ------------------------------------------------------------------
-
-
-func getExomesHandler(c *gin.Context) {
+// GET /exome_nullomers?length=<L>&page=<P>&limit=<N>&filters=…&specialFilters=…&column=…&filterType=between&value=…
+func getExomeNullomersHandler(c *gin.Context) {
     length := c.Query("length")
-
     if length == "" {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'length'"})
         return
     }
-
-    // Pagination
-    pageStr := c.Query("page")
-    limitStr := c.Query("limit")
-    filters := c.Query("filters")         // e.g. "(gc_content > 10) AND (gc_content < 50)"
-    specialFilters := c.Query("specialFilters") // e.g. "at_least_X_distinct_patients;3"
-    fmt.Println("🔍 Filters:", filters, "| Special Filters:", specialFilters)
-
-    page := 0
-    limit := 10000
-    if pageStr != "" {
-        if p, err := strconv.Atoi(pageStr); err == nil && p >= 0 {
-            page = p
-        }
-    }
-    if limitStr != "" {
-        if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 10000 {
-            limit = l
-        }
-    }
-
-
-    dbPath := getDatabasePath()
-
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
-    // 1) Base CTE returning *all* columns from the three tables, plus computed gc_content
-    baseQuery := fmt.Sprintf(`
-        WITH base AS (
-            SELECT
-            n.* EXCLUDE (Donor_ID), d.*, di.Tumor_Sample_Barcode, di.Matched_Norm_Sample_Barcode,
-                ROUND(
-                    100.0 * (
-                        LENGTH(n.nullomers_created)
-                        - LENGTH(REPLACE(UPPER(n.nullomers_created), 'G', ''))
-                        - LENGTH(REPLACE(UPPER(n.nullomers_created), 'C', ''))
-                    ) / LENGTH(n.nullomers_created),
-                    2
-                ) * -1 AS gc_content
-            FROM exome_neomers_%[1]s n
-            LEFT JOIN exomes_donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
-        )
-        SELECT * FROM base
-    `, length)
-
-    // Build WHERE Clause
-         whereClauses := []string{}
-         if filters != "" {
-             filterConditions := strings.Split(filters, " AND ") // Split individual filter conditions
-             for _, condition := range filterConditions {
-                 parts := strings.Fields(condition) // Split by space
-                 if len(parts) >= 3 {
-                     column := cleanColumnName(parts[0]) // Ensure column name is cleaned properly
-                     if isNumericColumn(column) {
-                         condition = fmt.Sprintf(`CAST("%s" AS FLOAT) %s %s`, column, parts[1], removeParentheses(parts[2]))
-                     }
-         
-                     whereClauses = append(whereClauses, condition)
-                 }
-             }
-         }
-    
-    // Special filters (like at_least_X_distinct_patients)
-    if specialFilters != "" {
-        parts := strings.Split(specialFilters, "|")
-        for _, part := range parts {
-            sfPieces := strings.Split(part, ";")
-            switch sfPieces[0] {
-            case "at_least_X_distinct_patients":
-                if len(sfPieces) == 2 {
-                    distinctStr := sfPieces[1]
-                    distinctCount, err := strconv.Atoi(distinctStr)
-                    if err == nil && distinctCount > 0 {
-                        subQuery := fmt.Sprintf(`
-                            nullomers_created IN (
-                                SELECT nullomers_created
-                                FROM exome_neomers_%[1]s n
-                                LEFT JOIN exomes_donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-                                LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
-                                GROUP BY nullomers_created
-                                HAVING COUNT(DISTINCT di.Actual_Donor_ID) >= %d
-                            )
-                        `, length, distinctCount)
-                        whereClauses = append(whereClauses, subQuery)
-                    }
-                }
-            }
-        }
-    }
-
-    finalWhere := ""
-    if len(whereClauses) > 0 {
-        finalWhere = " WHERE " + strings.Join(whereClauses, " AND ")
-    }
-
-    // 2) COUNT query with same CTE
-    countQuery := fmt.Sprintf(`
-      WITH base AS (
-            SELECT
-                n.*, 
-                d.*, 
-                di.Tumor_Sample_Barcode, 
-                di.Matched_Norm_Sample_Barcode,
-                ROUND(
-                    100.0 * (
-                        LENGTH(n.nullomers_created)
-                        - LENGTH(REPLACE(UPPER(n.nullomers_created), 'G', ''))
-                        - LENGTH(REPLACE(UPPER(n.nullomers_created), 'C', ''))
-                    ) / LENGTH(n.nullomers_created),
-                    2
-                ) * -1 AS gc_content
-            FROM exome_neomers_%[1]s n
-            LEFT JOIN exomes_donor_id_mapping di 
-                ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d 
-                ON di.Actual_Donor_ID = d.icgc_donor_id
-        )
-        SELECT COUNT(*) FROM base
-        %s
-    `, length, finalWhere)
-
-    var totalCount int
-    err = db.QueryRow(countQuery).Scan(&totalCount)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-
-    // 3) Final query with LIMIT/OFFSET
-    offset := page * limit
-    query := fmt.Sprintf("%s %s LIMIT %d OFFSET %d", baseQuery, finalWhere, limit, offset)
-    fmt.Println("Executing SQL Query:", query)
-
-
-    rows, err := db.Query(query)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer rows.Close()
-
-    columns, err := rows.Columns()
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-
-    data := make([][]interface{}, 0)
-    for rows.Next() {
-        row := make([]interface{}, len(columns))
-        rowPointers := make([]interface{}, len(columns))
-        for i := range row {
-            rowPointers[i] = &row[i]
-        }
-
-        if err := rows.Scan(rowPointers...); err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-            return
-        }
-
-        // Convert []byte -> string, handle NULL
-        for i, val := range row {
-            if b, ok := val.([]byte); ok {
-                row[i] = string(b)
-            }
-            if val == nil {
-                row[i] = nil
-            }
-        }
-        data = append(data, row)
-    }
-
-    result := map[string]interface{}{
-        "headers":    columns,
-        "data":       data,
-        "totalCount": totalCount,
-    }
-    c.JSON(http.StatusOK, result)
-}
-
-// ------------------------------------------------------------------
-// removeParentheses helper function
-// ------------------------------------------------------------------
-func removeParentheses(input string) string {
-    re := regexp.MustCompile(`[()]`) // Matches ( and )
-    return re.ReplaceAllString(input, "")
-}
-
-// ------------------------------------------------------------------
-// getExomesStatsHandler
-// ------------------------------------------------------------------
-
-func getExomesStatsHandler(c *gin.Context) {
-    length := c.Query("length")
-
-    if length == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'length'"})
-        return
+    page, _ := strconv.Atoi(c.DefaultQuery("page", "0"))
+    limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10000"))
+    if limit < 1 || limit > 10000 {
+        limit = 10000
     }
 
     filters := c.Query("filters")
-    groupByStr := c.Query("groupBy")
-    topNStr := c.Query("topN")
     specialFilters := c.Query("specialFilters")
-    log.Printf("Received length: %s", length)
 
-
-    topN := 10
-    if topNStr != "" {
-        if val, err := strconv.Atoi(topNStr); err == nil && val > 0 {
-            topN = val
+    // Build WHERE parts
+    var whereParts []string
+    if filters != "" {
+        // For any numeric comparison, cast column to DOUBLE
+        numericCols := []string{
+            "gc_content",
+            "AF", "AF_eas", "AF_afr", "AF_fin", "AF_ami",
+            "AF_amr", "AF_nfe", "AF_sas", "AF_asj",
+            "days_to_birth", "days_to_death", "days_to_last_followup",
         }
+        pattern := `\b(` + strings.Join(numericCols, "|") + `)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)`
+        re := regexp.MustCompile(pattern)
+        filtersCast := re.ReplaceAllString(filters, `CAST($1 AS DOUBLE) $2 $3`)
+        whereParts = append(whereParts, filtersCast)
     }
-
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
-    // We'll keep all columns from all three tables, plus negative GC content
-    baseCTE := fmt.Sprintf(`
-       WITH base AS (
-            SELECT
-                n.* EXCLUDE (Donor_ID),
-                d.*, 
-                di.Tumor_Sample_Barcode, 
-                di.Matched_Norm_Sample_Barcode,
-                ROUND(
-                    100.0 * (
-                        LENGTH(n.nullomers_created)
-                        - LENGTH(REPLACE(UPPER(n.nullomers_created), 'G', ''))
-                        - LENGTH(REPLACE(UPPER(n.nullomers_created), 'C', ''))
-                    ) / LENGTH(n.nullomers_created),
-                    2
-                ) * -1 AS gc_content
-            FROM exome_neomers_%[1]s n
-            LEFT JOIN exomes_donor_id_mapping di 
-                ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-            LEFT JOIN donor_data d 
-                ON di.Actual_Donor_ID = d.icgc_donor_id
-        )
-    `, length)
-
-      // Build WHERE Clause
-      whereClauses := []string{}
-      if filters != "" {
-          filterConditions := strings.Split(filters, " AND ") // Split individual filter conditions
-          for _, condition := range filterConditions {
-              parts := strings.Fields(condition) // Split by space
-              if len(parts) >= 3 {
-                  column := cleanColumnName(parts[0]) // Ensure column name is cleaned properly
-                  if isNumericColumn(column) {
-                      condition = fmt.Sprintf(`CAST("%s" AS FLOAT) %s %s`, column, parts[1], removeParentheses(parts[2]))
-                  }
-      
-                  whereClauses = append(whereClauses, condition)
-              }
-          }
-      }
-
     if specialFilters != "" {
-        parts := strings.Split(specialFilters, "|")
-        for _, part := range parts {
-            sfPieces := strings.Split(part, ";")
-            switch sfPieces[0] {
-            case "at_least_X_distinct_patients":
-                if len(sfPieces) == 2 {
-                    distinctStr := sfPieces[1]
-                    distinctCount, err := strconv.Atoi(distinctStr)
-                    if err == nil && distinctCount > 0 {
-                        subQuery := fmt.Sprintf(`
-                             nullomers_created IN (
-                                SELECT nullomers_created
-                                FROM exome_neomers_%[1]s n
-                                LEFT JOIN exomes_donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-                                LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
-                                GROUP BY nullomers_created
-                                HAVING COUNT(DISTINCT di.Actual_Donor_ID) >= %d
-                            )
-                        `, length, distinctCount)
-                        whereClauses = append(whereClauses, subQuery)
-                    }
+        for _, part := range strings.Split(specialFilters, "|") {
+            sf := strings.Split(part, ";")
+            if len(sf) == 2 && sf[0] == "at_least_X_distinct_patients" {
+                if n, err := strconv.Atoi(sf[1]); err == nil && n > 0 {
+                    sub := fmt.Sprintf(
+                        `"nullomers_created" IN (
+                            SELECT "nullomers_created"
+                            FROM exome_neomers_%s
+                            GROUP BY "nullomers_created"
+                            HAVING COUNT(DISTINCT "Donor_ID") >= %d
+                         )`, length, n)
+                    whereParts = append(whereParts, sub)
                 }
             }
         }
     }
 
     finalWhere := ""
-    if len(whereClauses) > 0 {
-        finalWhere = " WHERE " + strings.Join(whereClauses, " AND ")
+    if len(whereParts) > 0 {
+        finalWhere = " WHERE " + strings.Join(whereParts, " AND ")
     }
 
-    // Figure out groupBy
+    // 1) CTE definition
+    baseCTE := fmt.Sprintf(`
+WITH base AS (
+    SELECT
+        n.* EXCLUDE(Donor_ID),
+        di.Tumor_Sample_Barcode,
+        di.Matched_Norm_Sample_Barcode,
+        d.*,
+        ROUND(
+            100.0 * (
+                LENGTH(n.nullomers_created)
+                - LENGTH(REPLACE(UPPER(n.nullomers_created), 'G', ''))
+                - LENGTH(REPLACE(UPPER(n.nullomers_created), 'C', ''))
+            ) / LENGTH(n.nullomers_created),
+            2
+        ) * -1 AS gc_content
+    FROM exome_neomers_%s AS n
+    JOIN exomes_donor_id_mapping AS di
+        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+    LEFT JOIN exome_donor_data AS d
+        ON di.Actual_Donor_ID = d.bcr_patient_barcode
+)
+`, length)
+
+    // 2) Total count
+    countQ := baseCTE + "SELECT COUNT(*) FROM base" + finalWhere
+
+    db, err := sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    var totalCount int
+    if err := db.QueryRow(countQ).Scan(&totalCount); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    // 3) Page of data
+    offset := page * limit
+    pageQ := baseCTE +
+        "SELECT * FROM base" + finalWhere +
+        fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+
+    rows, err := db.Query(pageQ)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
+
+    cols, _ := rows.Columns()
+    var data [][]interface{}
+    for rows.Next() {
+        vals := make([]interface{}, len(cols))
+        ptrs := make([]interface{}, len(cols))
+        for i := range vals {
+            ptrs[i] = &vals[i]
+        }
+        if err := rows.Scan(ptrs...); err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+        for i, v := range vals {
+            if b, ok := v.([]byte); ok {
+                vals[i] = string(b)
+            }
+            if v == nil {
+                vals[i] = nil
+            }
+        }
+        data = append(data, vals)
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "headers":    cols,
+        "data":       data,
+        "totalCount": totalCount,
+    })
+}
+
+
+// getExomeSuggestionsHandler returns autocomplete suggestions for exome nullomer filters
+func getExomeSuggestionsHandler(c *gin.Context) {
+    column := c.Query("column")
+    input := c.Query("input")
+    length := c.Query("length")
+    if length == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing length"})
+        return
+    }
+    if column == "gc_content" {
+        c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
+        return
+    }
+
+    db, err := sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    lowerInput := strings.ToLower(input)
+    cond := ""
+    if lowerInput != "" {
+        cond = fmt.Sprintf("WHERE LOWER(%s) LIKE '%%%s%%'", column, lowerInput)
+    }
+
+    query := fmt.Sprintf(`
+        WITH base AS (
+            SELECT DISTINCT %s
+            FROM exome_neomers_%s n
+            JOIN exomes_donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+            JOIN exome_donor_data d ON di.Actual_Donor_ID = d.bcr_patient_barcode
+            %s
+            LIMIT 10
+        )
+        SELECT %s
+        FROM base
+        ORDER BY LOWER(%s) ASC
+    `, column, length, cond, column, column)
+
+    rows, err := db.Query(query)
+    if err != nil {
+        c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
+        return
+    }
+    defer rows.Close()
+
+    var suggestions []string
+    for rows.Next() {
+        var val interface{}
+        if err := rows.Scan(&val); err != nil {
+            continue
+        }
+        if s, ok := val.(string); ok {
+            suggestions = append(suggestions, s)
+        } else if val != nil {
+            suggestions = append(suggestions, fmt.Sprintf("%v", val))
+        }
+    }
+
+    c.JSON(http.StatusOK, gin.H{"suggestions": suggestions})
+}
+
+// GET /exome_nullomers_stats?length=<L>&filters=…&specialFilters=…&groupBy=…&topN=…&column=…&filterType=between&value=…
+func getExomeNullomersStatsHandler(c *gin.Context) {
+    length := c.Query("length")
+    if length == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'length'"})
+        return
+    }
+    filters := c.Query("filters")
+    specialFilters := c.Query("specialFilters")
+    groupByStr := c.Query("groupBy")
+    topNStr := c.Query("topN")
+
+    topN := 10
+    if n, err := strconv.Atoi(topNStr); err == nil && n > 0 {
+        topN = n
+    }
+
+    // Build WHERE parts (with casting for numeric columns)...
+    var whereParts []string
+    if filters != "" {
+        numericCols := []string{
+            "gc_content",
+            "AF", "AF_eas", "AF_afr", "AF_fin", "AF_ami",
+            "AF_amr", "AF_nfe", "AF_sas", "AF_asj",
+            "days_to_birth", "days_to_death", "days_to_last_followup",
+        }
+        pattern := `\b(` + strings.Join(numericCols, "|") + `)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)`
+        re := regexp.MustCompile(pattern)
+        filtersCast := re.ReplaceAllString(filters, `CAST($1 AS DOUBLE) $2 $3`)
+        whereParts = append(whereParts, filtersCast)
+    }
+    if specialFilters != "" {
+        for _, part := range strings.Split(specialFilters, "|") {
+            sf := strings.Split(part, ";")
+            if len(sf) == 2 && sf[0] == "at_least_X_distinct_patients" {
+                if n, err := strconv.Atoi(sf[1]); err == nil && n > 0 {
+                    sub := fmt.Sprintf(
+                        `"nullomers_created" IN (
+                            SELECT "nullomers_created"
+                            FROM exome_neomers_%s
+                            GROUP BY "nullomers_created"
+                            HAVING COUNT(DISTINCT "Donor_ID") >= %d
+                         )`, length, n)
+                    whereParts = append(whereParts, sub)
+                }
+            }
+        }
+    }
+    finalWhere := ""
+    if len(whereParts) > 0 {
+        finalWhere = " WHERE " + strings.Join(whereParts, " AND ")
+    }
+
+    // 1) Base CTE: include ALL donor‐data columns (d.*) plus mapping cols
+    baseCTE := fmt.Sprintf(`
+WITH base AS (
+    SELECT
+        n.* EXCLUDE(Donor_ID),
+        di.Tumor_Sample_Barcode,
+        di.Matched_Norm_Sample_Barcode,
+        d.*,  -- bring in every column from exome_donor_data
+        ROUND(
+            100.0 * (
+                LENGTH(n.nullomers_created)
+                - LENGTH(REPLACE(UPPER(n.nullomers_created), 'G', ''))
+                - LENGTH(REPLACE(UPPER(n.nullomers_created), 'C', ''))
+            ) / LENGTH(n.nullomers_created),
+            2
+        ) * -1 AS gc_content
+    FROM exome_neomers_%s AS n
+    JOIN exomes_donor_id_mapping AS di
+        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+    LEFT JOIN exome_donor_data AS d
+        ON di.Actual_Donor_ID = d.bcr_patient_barcode
+)
+`, length)
+
+    // 2) Build GROUP BY / SELECT
     groupByCols := []string{"nullomers_created"}
     selectCols := []string{"nullomers_created"}
-
     if groupByStr != "" {
-        additional := strings.Split(groupByStr, ",")
-        for _, col := range additional {
+        for _, col := range strings.Split(groupByStr, ",") {
             col = strings.TrimSpace(col)
             if col != "" {
                 groupByCols = append(groupByCols, col)
@@ -953,97 +935,121 @@ func getExomesStatsHandler(c *gin.Context) {
             }
         }
     }
-
     selectClause := strings.Join(selectCols, ", ")
-    groupByClause := strings.Join(groupByCols, ", ")
+    groupByClause  := strings.Join(groupByCols, ", ")
 
-    // Build final stats query
-    query := fmt.Sprintf(`
-        %s
-        SELECT
-            %s,
-            COUNT(*) AS total_count
-        FROM base
-        %s
-        GROUP BY %s
-        ORDER BY total_count DESC
-        LIMIT %d
-    `, baseCTE, selectClause, finalWhere, groupByClause, topN)
+    // 3) Stats query
+    statsQ := baseCTE +
+        fmt.Sprintf(
+            "SELECT %s, COUNT(*) AS total_count FROM base%s GROUP BY %s ORDER BY total_count DESC LIMIT %d",
+            selectClause, finalWhere, groupByClause, topN,
+        )
 
-    rows, err := db.Query(query)
+    db, err := sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    rows, err := db.Query(statsQ)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer rows.Close()
 
-    columns, err := rows.Columns()
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-
-    data := make([][]interface{}, 0)
+    cols, _ := rows.Columns()
+    var data [][]interface{}
     for rows.Next() {
-        row := make([]interface{}, len(columns))
-        rowPointers := make([]interface{}, len(columns))
-        for i := range row {
-            rowPointers[i] = &row[i]
+        vals := make([]interface{}, len(cols))
+        ptrs := make([]interface{}, len(cols))
+        for i := range vals {
+            ptrs[i] = &vals[i]
         }
-        if err := rows.Scan(rowPointers...); err != nil {
+        if err := rows.Scan(ptrs...); err != nil {
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
             return
         }
-
-        for i, val := range row {
-            if b, ok := val.([]byte); ok {
-                row[i] = string(b)
+        for i, v := range vals {
+            if b, ok := v.([]byte); ok {
+                vals[i] = string(b)
             }
-            if val == nil {
-                row[i] = nil
+            if v == nil {
+                vals[i] = nil
             }
         }
-        data = append(data, row)
+        data = append(data, vals)
     }
 
-    result := map[string]interface{}{
-        "headers": columns,
+    c.JSON(http.StatusOK, gin.H{
+        "headers": cols,
         "data":    data,
-    }
-    c.JSON(http.StatusOK, result)
+    })
 }
+
+
+
+
 
 // ------------------------------------------------------------------
 // getPatientDetailsHandler
 // ------------------------------------------------------------------
 func getPatientDetailsHandler(c *gin.Context) {
-    donorID := c.Query("donor_id")
-    if donorID == "" {
+    // 1) Read the actual donor string
+    actualID := c.Query("donor_id")
+    if actualID == "" {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing donor_id"})
         return
     }
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
+    db, err := sql.Open("duckdb", getDatabasePath())
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer db.Close()
 
-    // Example query (customize as needed).
-    // We assume "Project_Code" is in "donor_data" so we can join with "cancer_type_details"
+    // 2) Map Actual_Donor_ID → internal Donor_ID
+    var internalID int
+    err = db.QueryRow(`
+        SELECT Donor_ID 
+        FROM donor_id_mapping 
+        WHERE Actual_Donor_ID = ?
+    `, actualID).Scan(&internalID)
+    if err != nil {
+        // no mapping found → no patient
+        c.JSON(http.StatusOK, gin.H{"patient": nil})
+        return
+    }
+
+    // 3) Grab one Project_Code from neomers_15
+    var projectCode string
+    err = db.QueryRow(`
+        SELECT Project_Code
+        FROM neomers_15
+        WHERE Donor_ID = ?
+        LIMIT 1
+    `, internalID).Scan(&projectCode)
+    if err != nil {
+        c.JSON(http.StatusOK, gin.H{"patient": nil})
+        return
+    }
+
+    // 4) Now join donor_data + cancer_type_details on that Project_Code
     query := `
         SELECT d.*, c.Cancer_Type, c.Organ
-        FROM donor_data d, cancer_type_details c
-        WHERE d.icgc_donor_id = ? 
-          AND POSITION(c.Acronym IN d.project_code) > 0
+        FROM donor_data d
+        JOIN cancer_type_details c
+          ON c.Project_Code = ?
+        WHERE d.icgc_donor_id = ?
         LIMIT 1
     `
-    row := db.QueryRow(query, donorID)
+    row := db.QueryRow(query, projectCode, actualID)
 
-    // Grab columns you want or do "SELECT ..." instead of "*".
-    columns, err := db.Query("SELECT * FROM donor_data LIMIT 0") // just to get column names
+    // --- rest is identical to before: dynamically fetch column names & scan ---
+
+    columns, err := db.Query("SELECT * FROM donor_data LIMIT 0")
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
@@ -1051,7 +1057,7 @@ func getPatientDetailsHandler(c *gin.Context) {
     colNames, _ := columns.Columns()
     columns.Close()
 
-    // Append the extra columns from cancer_type_details
+    // add our two extra fields
     colNames = append(colNames, "Cancer_Type", "Organ")
 
     vals := make([]interface{}, len(colNames))
@@ -1061,23 +1067,23 @@ func getPatientDetailsHandler(c *gin.Context) {
     }
 
     if err := row.Scan(valPtrs...); err != nil {
-        // If not found, return "patient": nil instead of an error
         c.JSON(http.StatusOK, gin.H{"patient": nil})
-        fmt.Println(err)
         return
     }
 
-    // Convert to map
-    patientMap := make(map[string]interface{})
-    for i, colName := range colNames {
-        patientMap[colName] = vals[i]
-        if b, ok := vals[i].([]byte); ok {
-            patientMap[colName] = string(b)
+    patientMap := make(map[string]interface{}, len(colNames))
+    for i, name := range colNames {
+        v := vals[i]
+        if b, ok := v.([]byte); ok {
+            patientMap[name] = string(b)
+        } else {
+            patientMap[name] = v
         }
     }
 
     c.JSON(http.StatusOK, gin.H{"patient": patientMap})
 }
+
 
 // ------------------------------------------------------------------
 // getPatientNeomersHandler
@@ -1092,7 +1098,6 @@ func getPatientNeomersHandler(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing donor_id"})
         return
     }
-
     if lengthStr == "" {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing length"})
         return
@@ -1104,48 +1109,42 @@ func getPatientNeomersHandler(c *gin.Context) {
         return
     }
 
-    topN := 10 // default
+    topN := 10
     if topNStr != "" {
-        topNParsed, err := strconv.Atoi(topNStr)
-        if err == nil && topNParsed > 0 {
-            topN = topNParsed
+        if n, err := strconv.Atoi(topNStr); err == nil && n > 0 {
+            topN = n
         }
     }
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
+    db, err := sql.Open("duckdb", getDatabasePath())
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer db.Close()
 
-    // Dynamically inject the length variable into the table name
     tableName := fmt.Sprintf("neomers_%d", length)
 
-    // Build the query. Now we join with cancer_type_details and donor_data 
-    // in the same pattern:
+    // ←––––– HERE’S THE ONLY CHANGE ––––––→
     baseQuery := fmt.Sprintf(`
         SELECT 
             n.nullomers_created AS neomer, 
-            COUNT(*) AS count
+            COUNT(*)            AS count
         FROM %s n
-        JOIN cancer_type_details c USING (Project_Code)
-        JOIN donor_data d ON n.donor_id = d.icgc_donor_id
-        WHERE n.donor_id = ?
+        JOIN cancer_type_details c         USING (Project_Code)
+        JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+        JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id
+        WHERE di.Actual_Donor_ID = ?
     `, tableName)
 
     var args []interface{}
     args = append(args, donorID)
 
-    // If prefix is provided, add a LIKE condition
     if prefix != "" {
         baseQuery += " AND n.nullomers_created LIKE ?"
-        likePattern := prefix + "%"
-        args = append(args, likePattern)
+        args = append(args, prefix+"%")
     }
 
-    // Add GROUP BY, ORDER BY, and LIMIT clauses
     baseQuery += `
         GROUP BY neomer
         ORDER BY count DESC
@@ -1160,7 +1159,7 @@ func getPatientNeomersHandler(c *gin.Context) {
     }
     defer rows.Close()
 
-    result := []map[string]interface{}{}
+    var result []map[string]interface{}
     for rows.Next() {
         var neomer string
         var count int
@@ -1171,9 +1170,9 @@ func getPatientNeomersHandler(c *gin.Context) {
             })
         }
     }
-
     c.JSON(http.StatusOK, gin.H{"neomers": result})
 }
+
 
 
 // analyzeNeomerHandler
@@ -1192,54 +1191,53 @@ func analyzeNeomerHandler(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing neomer parameter"})
         return
     }
-
-    neomerLength := len(neomer)
-    if neomerLength < 11 || neomerLength > 20 {
+    K := len(neomer)
+    if K < 11 || K > 20 {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Neomer length must be between 11 and 20"})
         return
     }
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
+    db, err := sql.Open("duckdb", getDatabasePath())
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
     defer db.Close()
 
-    tableName := fmt.Sprintf("neomers_%d", neomerLength)
+    tableName := fmt.Sprintf("neomers_%d", K)
 
-    // First Query: Basic Statistics
+    // —— First query: overall stats —— 
     totalQuery := fmt.Sprintf(`
         SELECT
-            COUNT(*) AS total_count,
-            COUNT(DISTINCT n.donor_id) AS distinct_donors,
-            COUNT(DISTINCT c.Cancer_Type) AS distinct_cancer_types,
-            COUNT(DISTINCT c.Organ) AS distinct_organs
+            COUNT(*)                          AS total_count,
+            COUNT(DISTINCT di.Actual_Donor_ID) AS distinct_donors,
+            COUNT(DISTINCT c.Cancer_Type)     AS distinct_cancer_types,
+            COUNT(DISTINCT c.Organ)           AS distinct_organs
         FROM %s n
-        JOIN cancer_type_details c USING (Project_Code)
-        JOIN donor_data d ON n.donor_id = d.icgc_donor_id
+        JOIN cancer_type_details c         USING (Project_Code)
+        JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+        JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id
         WHERE n.nullomers_created = ?
     `, tableName)
 
-    row := db.QueryRow(totalQuery, neomer)
-
     var totalCount, distinctDonors, distinctCancerTypes, distinctOrgans int
-    err = row.Scan(&totalCount, &distinctDonors, &distinctCancerTypes, &distinctOrgans)
-    if err != nil {
+    if err := db.QueryRow(totalQuery, neomer).Scan(
+        &totalCount, &distinctDonors, &distinctCancerTypes, &distinctOrgans,
+    ); err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
 
-    // Second Query: Breakdown by Cancer_Type and Organ
+    // —— Second query: breakdown —— 
     breakdownQuery := fmt.Sprintf(`
         SELECT
             c.Cancer_Type,
             c.Organ,
             COUNT(*) AS count
         FROM %s n
-        JOIN cancer_type_details c USING (Project_Code)
-        JOIN donor_data d ON n.donor_id = d.icgc_donor_id
+        JOIN cancer_type_details c         USING (Project_Code)
+        JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+        JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id
         WHERE n.nullomers_created = ?
         GROUP BY c.Cancer_Type, c.Organ
     `, tableName)
@@ -1251,12 +1249,10 @@ func analyzeNeomerHandler(c *gin.Context) {
     }
     defer rows.Close()
 
-    // Structures to hold the breakdown data
     type OrganCount struct {
         Organ string `json:"organ"`
         Count int    `json:"count"`
     }
-
     type CancerTypeCount struct {
         CancerType string       `json:"cancerType"`
         Count      int          `json:"count"`
@@ -1264,48 +1260,36 @@ func analyzeNeomerHandler(c *gin.Context) {
     }
 
     cancerMap := make(map[string]*CancerTypeCount)
-
     for rows.Next() {
-        var cancerType, organ string
-        var count int
-        err := rows.Scan(&cancerType, &organ, &count)
-        if err != nil {
+        var ct, organ string
+        var cnt int
+        if err := rows.Scan(&ct, &organ, &cnt); err != nil {
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
             return
         }
-
-        if _, exists := cancerMap[cancerType]; !exists {
-            cancerMap[cancerType] = &CancerTypeCount{
-                CancerType: cancerType,
-                Count:      0,
-                Organs:     []OrganCount{},
-            }
+        if _, ok := cancerMap[ct]; !ok {
+            cancerMap[ct] = &CancerTypeCount{CancerType: ct}
         }
-
-        cancerMap[cancerType].Count += count
-        cancerMap[cancerType].Organs = append(cancerMap[cancerType].Organs, OrganCount{
-            Organ: organ,
-            Count: count,
-        })
+        cancerMap[ct].Count += cnt
+        cancerMap[ct].Organs = append(cancerMap[ct].Organs, OrganCount{Organ: organ, Count: cnt})
     }
 
-    // Convert map to slice for JSON serialization
-    cancerTypes := make([]CancerTypeCount, 0, len(cancerMap))
-    for _, ct := range cancerMap {
-        cancerTypes = append(cancerTypes, *ct)
+    var breakdown []CancerTypeCount
+    for _, v := range cancerMap {
+        breakdown = append(breakdown, *v)
     }
 
-    // Construct the final analysis response
-    analysis := map[string]interface{}{
-        "totalNeomers":        totalCount,
-        "distinctDonors":      distinctDonors,
-        "distinctCancerTypes": distinctCancerTypes,
-        "distinctOrgans":      distinctOrgans,
-        "cancerBreakdown":     cancerTypes,
-    }
-
-    c.JSON(http.StatusOK, gin.H{"analysis": analysis})
+    c.JSON(http.StatusOK, gin.H{
+        "analysis": map[string]interface{}{
+            "totalNeomers":        totalCount,
+            "distinctDonors":      distinctDonors,
+            "distinctCancerTypes": distinctCancerTypes,
+            "distinctOrgans":      distinctOrgans,
+            "cancerBreakdown":     breakdown,
+        },
+    })
 }
+
 
 
 // ------------------------------------------------------------------
@@ -1643,6 +1627,408 @@ func getDatasetStatsCancerTypesVaryingKHandler(c *gin.Context){
 
     }
     c.JSON(http.StatusOK, gin.H{"stats": all_results})
-
-   
+  
 }
+
+// GET /distribution_neomer_16/cancer_types
+// Returns all distinct Cancer_Type from distribution_neomer_16_per_cancer.
+func getDistNeomer16CancerTypes(c *gin.Context) {
+    dbPath := getDatabasePath()
+    db, err := sql.Open("duckdb", dbPath)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    rows, err := db.Query(`
+        SELECT DISTINCT Cancer_Type
+        FROM distribution_neomer_16_per_cancer
+        ORDER BY Cancer_Type
+    `)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
+
+    var types []string
+    for rows.Next() {
+        var t string
+        if err := rows.Scan(&t); err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+        types = append(types, t)
+    }
+    c.JSON(http.StatusOK, gin.H{"cancerTypes": types})
+}
+
+// GET /distribution_neomer_16/organ
+// Returns all distinct Organ from distribution_neomer_16_per_organ.
+func getDistNeomer16Organ(c *gin.Context) {
+    dbPath := getDatabasePath()
+    db, err := sql.Open("duckdb", dbPath)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    rows, err := db.Query(`
+        SELECT DISTINCT Organ
+        FROM distribution_neomer_16_per_organ
+        ORDER BY Organ;
+    `)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
+
+    var organs []string
+    for rows.Next() {
+        var t string
+        if err := rows.Scan(&t); err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+        organs = append(organs, t)
+    }
+    c.JSON(http.StatusOK, gin.H{"organs": organs})
+}
+
+// GET /distribution_neomer_16?cancerType=...
+// Returns [{ donor_count:int, num_nullomers:int }, …] for that cancer type.
+func getDistNeomer16Data(c *gin.Context) {
+    ct := c.Query("cancerType")
+    if ct == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing cancerType parameter"})
+        return
+    }
+
+    dbPath := getDatabasePath()
+    db, err := sql.Open("duckdb", dbPath)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    stmt := `
+      SELECT donor_count, num_nullomers
+      FROM distribution_neomer_16_per_cancer
+      WHERE Cancer_Type = ?
+      ORDER BY donor_count
+    `
+    rows, err := db.Query(stmt, ct)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
+
+    type bucket struct {
+        DonorCount    int64 `json:"donorCount"`
+        NumNullomers  int64 `json:"numNullomers"`
+    }
+    var data []bucket
+    for rows.Next() {
+        var b bucket
+        if err := rows.Scan(&b.DonorCount, &b.NumNullomers); err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+        data = append(data, b)
+    }
+    c.JSON(http.StatusOK, gin.H{
+        "cancerType": ct,
+        "distribution": data,
+    })
+}
+
+// GET /distribution_neomer_16?organs=...
+// Returns [{ donor_count:int, num_nullomers:int }, …] for that cancer type.
+func getDistNeomer16DataOrgans(c *gin.Context) {
+    o := c.Query("organ")
+    if o == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing organ parameter"})
+        return
+    }
+
+    dbPath := getDatabasePath()
+    db, err := sql.Open("duckdb", dbPath)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    stmt := `
+      SELECT donor_count, num_nullomers
+      FROM distribution_neomer_16_per_organ
+      WHERE Organ = ?
+      ORDER BY donor_count
+    `
+    rows, err := db.Query(stmt, o)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
+
+    type bucket struct {
+        DonorCount    int64 `json:"donorCount"`
+        NumNullomers  int64 `json:"numNullomers"`
+    }
+    var data []bucket
+    for rows.Next() {
+        var b bucket
+        if err := rows.Scan(&b.DonorCount, &b.NumNullomers); err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+        data = append(data, b)
+    }
+    c.JSON(http.StatusOK, gin.H{
+        "Organ": o,
+        "distribution": data,
+    })
+}
+
+
+// GET /exome_patient_details?donor_id=…
+func getExomePatientDetailsHandler(c *gin.Context) {
+    actualID := c.Query("donor_id")
+    if actualID == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing donor_id"})
+        return
+    }
+
+    db, err := sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    // 1) Grab the column names dynamically
+    cols, err := db.Query(`SELECT * FROM exome_donor_data LIMIT 0`)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    colNames, _ := cols.Columns()
+    cols.Close()
+
+    // 2) Fetch the one matching row (bcr_patient_barcode = actualID)
+    row := db.QueryRow(`
+        SELECT * 
+        FROM exome_donor_data 
+        WHERE bcr_patient_barcode = ? 
+        LIMIT 1
+    `, actualID)
+
+    // 3) Scan into a slice of interfaces
+    vals := make([]interface{}, len(colNames))
+    ptrs := make([]interface{}, len(colNames))
+    for i := range vals {
+        ptrs[i] = &vals[i]
+    }
+    if err := row.Scan(ptrs...); err != nil {
+        // no match
+        c.JSON(http.StatusOK, gin.H{"patient": nil})
+        return
+    }
+
+    // 4) Build a map[string]interface{} to JSON-ify
+    patient := make(map[string]interface{}, len(colNames))
+    for i, name := range colNames {
+        v := vals[i]
+        if b, ok := v.([]byte); ok {
+            patient[name] = string(b)
+        } else {
+            patient[name] = v
+        }
+    }
+
+    c.JSON(http.StatusOK, gin.H{"patient": patient})
+}
+
+
+
+// GET /exome_patient_neomers?donor_id=…&length=…&top_n=…[&prefix=…]
+func getExomePatientNeomersHandler(c *gin.Context) {
+    donorID := c.Query("donor_id")
+    lengthStr := c.Query("length")
+    topNStr := c.Query("top_n")
+    prefix := c.Query("prefix")
+
+    if donorID == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing donor_id"})
+        return
+    }
+    if lengthStr == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing length"})
+        return
+    }
+    length, err := strconv.Atoi(lengthStr)
+    if err != nil || length < 11 || length > 20 {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid length. Must be between 11 and 20."})
+        return
+    }
+
+    topN := 10
+    if topNStr != "" {
+        if n, err := strconv.Atoi(topNStr); err == nil && n > 0 {
+            topN = n
+        }
+    }
+
+    db, err := sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer db.Close()
+
+    tableName := fmt.Sprintf("exome_neomers_%d", length)
+
+    // build the base query
+    baseQuery := fmt.Sprintf(`
+        SELECT
+          n.nullomers_created AS neomer,
+          COUNT(*) AS count
+        FROM %s n
+        JOIN exomes_donor_id_mapping m
+          ON n.Donor_ID = m.Donor_ID
+        WHERE m.Actual_Donor_ID = ?
+    `, tableName)
+
+    args := []interface{}{donorID}
+    if prefix != "" {
+        baseQuery += " AND n.nullomers_created LIKE ?"
+        args = append(args, prefix+"%")
+    }
+    baseQuery += `
+        GROUP BY neomer
+        ORDER BY count DESC
+        LIMIT ?
+    `
+    args = append(args, topN)
+
+    rows, err := db.Query(baseQuery, args...)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
+
+    var out []map[string]interface{}
+    for rows.Next() {
+        var nm string
+        var ct int
+        if err := rows.Scan(&nm, &ct); err == nil {
+            out = append(out, map[string]interface{}{
+                "neomer": nm,
+                "count":  ct,
+            })
+        }
+    }
+
+    c.JSON(http.StatusOK, gin.H{"neomers": out})
+}
+
+
+// GET /exome_analyze_neomer?neomer=XYZ
+func getExomeAnalyzeNeomerHandler(c *gin.Context) {
+    neomer := c.Query("neomer")
+    if neomer == "" {
+      c.JSON(http.StatusBadRequest, gin.H{"error": "Missing neomer"})
+      return
+    }
+    // infer length from string
+    length := len([]rune(neomer))
+    tableName := fmt.Sprintf("exome_neomers_%d", length)
+  
+    db, err := sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+      c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+      return
+    }
+    defer db.Close()
+  
+    // 1) Cancer Type breakdown
+    cancerQ := fmt.Sprintf(`
+      SELECT d.Cancer_Type    AS cancerType,
+             COUNT(DISTINCT di.Donor_ID) AS count
+      FROM %s AS n
+      JOIN exomes_donor_id_mapping AS di
+        ON n.Donor_ID = di.Donor_ID
+      JOIN exome_donor_data AS d
+        ON di.Actual_Donor_ID = d.bcr_patient_barcode
+      WHERE n.nullomers_created = ?
+      GROUP BY d.Cancer_Type
+      ORDER BY count DESC
+    `, tableName)
+  
+    cancerRows, err := db.Query(cancerQ, neomer)
+    if err != nil {
+      c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+      return
+    }
+    defer cancerRows.Close()
+  
+    var cancerBreakdown []map[string]interface{}
+    for cancerRows.Next() {
+      var ct string
+      var cnt int
+      if err := cancerRows.Scan(&ct, &cnt); err == nil {
+        cancerBreakdown = append(cancerBreakdown, map[string]interface{}{
+          "cancerType": ct,
+          "count":      cnt,
+        })
+      }
+    }
+  
+    // 2) Organ breakdown
+    organQ := fmt.Sprintf(`
+      SELECT d.Organ         AS organ,
+             COUNT(DISTINCT di.Donor_ID) AS count
+      FROM %s AS n
+      JOIN exomes_donor_id_mapping AS di
+        ON n.Donor_ID = di.Donor_ID
+      JOIN exome_donor_data AS d
+        ON di.Actual_Donor_ID = d.bcr_patient_barcode
+      WHERE n.nullomers_created = ?
+      GROUP BY d.Organ
+      ORDER BY count DESC
+    `, tableName)
+  
+    organRows, err := db.Query(organQ, neomer)
+    if err != nil {
+      c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+      return
+    }
+    defer organRows.Close()
+  
+    var organBreakdown []map[string]interface{}
+    for organRows.Next() {
+      var org string
+      var cnt int
+      if err := organRows.Scan(&org, &cnt); err == nil {
+        organBreakdown = append(organBreakdown, map[string]interface{}{
+          "organ": org,
+          "count": cnt,
+        })
+      }
+    }
+  
+    c.JSON(http.StatusOK, gin.H{
+      "analysis": gin.H{
+        "cancerBreakdown": cancerBreakdown,
+        "organBreakdown":  organBreakdown,
+      },
+    })
+  }
+  
