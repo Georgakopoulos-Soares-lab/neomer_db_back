@@ -48,10 +48,10 @@ func main() {
 
     router.GET("/dataset_stats_cancer_types_varying_k", getDatasetStatsCancerTypesVaryingKHandler)
     
-    router.GET("/distribution_neomer_16/cancer_types", getDistNeomer16CancerTypes)
-    router.GET("/distribution_neomer_16", getDistNeomer16Data)
-    router.GET("/distribution_neomer_16/organs", getDistNeomer16Organ)
-    router.GET("/distribution_neomer_16_organs", getDistNeomer16DataOrgans)
+    router.GET("/distribution_neomer/:K/cancer_types", getDistNeomerKCancerTypes)
+    router.GET("/distribution_neomer/:K/organs", getDistNeomerKOrgans)
+    router.GET("/distribution_neomer/:K/data_by_cancer_type", getDistNeomerKDataByCancerType)
+    router.GET("/distribution_neomer/:K/data_by_organ", getDistNeomerKDataByOrgan)
     
     router.GET("/exome_patient_details", getExomePatientDetailsHandler)
     router.GET("/exome_patient_neomers",  getExomePatientNeomersHandler)
@@ -394,71 +394,83 @@ func isNumericColumn(column string) bool {
 // ------------------------------------------------------------------
 // getSuggestionsHandler
 // ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// getSuggestionsHandler
+// ------------------------------------------------------------------
 func getSuggestionsHandler(c *gin.Context) {
-    column := c.Query("column")
-    input := c.Query("input")
-    // filterType := c.Query("filterType")
-    length := c.Query("length")
-    if length == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing length"})
-        return
-    }
+	column := c.Query("column")
+	input := c.Query("input")
+	length := c.Query("length")
 
-    // If user tries to get suggestions for numeric columns like gc_content,
-    // we typically skip. But do as you wish:
-    if column == "gc_content" {
-        c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
-        return
-    }
+	if length == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'length'"})
+		return
+	}
+	if column == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required parameter 'column'"})
+		return
+	}
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
+	// It's not meaningful to get suggestions for a purely numeric column like this
+	if column == "gc_content" {
+		c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
+		return
+	}
 
-    lowerInput := strings.ToLower(input)
-    var cond string
-    if lowerInput == "" {
-        cond = ""
-    } else {
-        cond = fmt.Sprintf("WHERE LOWER(%s) LIKE '%%%s%%'", column, lowerInput)
-    }
+	dbPath := getDatabasePath()
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer db.Close()
 
-    query := fmt.Sprintf(`
+	lowerInput := strings.ToLower(input)
+	var whereClause string
+	if lowerInput != "" {
+		// Use CAST to VARCHAR to safely perform a LIKE search on any column type
+		whereClause = fmt.Sprintf("WHERE LOWER(CAST(%s AS VARCHAR)) LIKE '%%%s%%'", column, lowerInput)
+	}
+
+	// This query now joins all relevant tables, allowing suggestions from any of them.
+	query := fmt.Sprintf(`
         WITH base AS (
             SELECT DISTINCT %s
-            FROM nullomers_%s
-            JOIN cancer_type_details USING (Project_Code)
+            FROM neomers_%s n
+            JOIN cancer_type_details c USING (Project_Code)
+            LEFT JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+            LEFT JOIN donor_data d ON di.Actual_Donor_ID = d.icgc_donor_id
             %s
             LIMIT 10
         )
         SELECT %s
         FROM base
-        ORDER BY LOWER(%s) ASC
-    `, column, length, cond, column, column)
+		WHERE %s IS NOT NULL
+        ORDER BY LOWER(CAST(%s AS VARCHAR)) ASC
+    `, column, length, whereClause, column, column, column)
 
-    rows, err := db.Query(query)
-    if err != nil {
-        c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
-        return
-    }
-    defer rows.Close()
+	rows, err := db.Query(query)
+	if err != nil {
+		// Log the error and return empty suggestions to prevent frontend issues
+		log.Printf("Suggestion query failed for column '%s': %v", column, err)
+		c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
+		return
+	}
+	defer rows.Close()
 
-    suggestions := []string{}
-    for rows.Next() {
-        var val interface{}
-        if err := rows.Scan(&val); err == nil {
-            if v, ok := val.(string); ok {
-                suggestions = append(suggestions, v)
-            } else if val != nil {
-                suggestions = append(suggestions, fmt.Sprintf("%v", val))
-            }
-        }
-    }
-    c.JSON(http.StatusOK, gin.H{"suggestions": suggestions})
+	var suggestions []string
+	for rows.Next() {
+		var val interface{}
+		if err := rows.Scan(&val); err == nil {
+			if v, ok := val.(string); ok {
+				suggestions = append(suggestions, v)
+			} else if val != nil {
+				// Convert non-string types to their string representation for the response
+				suggestions = append(suggestions, fmt.Sprintf("%v", val))
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"suggestions": suggestions})
 }
 
 // ------------------------------------------------------------------
@@ -1630,9 +1642,13 @@ func getDatasetStatsCancerTypesVaryingKHandler(c *gin.Context){
   
 }
 
-// GET /distribution_neomer_16/cancer_types
-// Returns all distinct Cancer_Type from distribution_neomer_16_per_cancer.
-func getDistNeomer16CancerTypes(c *gin.Context) {
+func getDistNeomerKCancerTypes(c *gin.Context) {
+    K := c.Param("K")
+    if _, err := strconv.Atoi(K); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter K must be an integer"})
+        return
+    }
+
     dbPath := getDatabasePath()
     db, err := sql.Open("duckdb", dbPath)
     if err != nil {
@@ -1641,13 +1657,17 @@ func getDistNeomer16CancerTypes(c *gin.Context) {
     }
     defer db.Close()
 
-    rows, err := db.Query(`
+    tableName := fmt.Sprintf("distribution_neomer_%s_per_cancer", K)
+    query := fmt.Sprintf(`
         SELECT DISTINCT Cancer_Type
-        FROM distribution_neomer_16_per_cancer
+        FROM %s
         ORDER BY Cancer_Type
-    `)
+    `, tableName)
+
+    rows, err := db.Query(query)
     if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        // Handle cases where the table for K might not exist
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Query failed, possibly no data for K=%s: %v", K, err)})
         return
     }
     defer rows.Close()
@@ -1664,9 +1684,15 @@ func getDistNeomer16CancerTypes(c *gin.Context) {
     c.JSON(http.StatusOK, gin.H{"cancerTypes": types})
 }
 
-// GET /distribution_neomer_16/organ
-// Returns all distinct Organ from distribution_neomer_16_per_organ.
-func getDistNeomer16Organ(c *gin.Context) {
+// GET /distribution_neomer/:K/organs
+// Returns all distinct Organ from the distribution table for a given K.
+func getDistNeomerKOrgans(c *gin.Context) {
+    K := c.Param("K")
+    if _, err := strconv.Atoi(K); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter K must be an integer"})
+        return
+    }
+
     dbPath := getDatabasePath()
     db, err := sql.Open("duckdb", dbPath)
     if err != nil {
@@ -1675,35 +1701,43 @@ func getDistNeomer16Organ(c *gin.Context) {
     }
     defer db.Close()
 
-    rows, err := db.Query(`
+    tableName := fmt.Sprintf("distribution_neomer_%s_per_organ", K)
+    query := fmt.Sprintf(`
         SELECT DISTINCT Organ
-        FROM distribution_neomer_16_per_organ
+        FROM %s
         ORDER BY Organ;
-    `)
+    `, tableName)
+
+    rows, err := db.Query(query)
     if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Query failed, possibly no data for K=%s: %v", K, err)})
         return
     }
     defer rows.Close()
 
     var organs []string
     for rows.Next() {
-        var t string
-        if err := rows.Scan(&t); err != nil {
+        var o string
+        if err := rows.Scan(&o); err != nil {
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
             return
         }
-        organs = append(organs, t)
+        organs = append(organs, o)
     }
     c.JSON(http.StatusOK, gin.H{"organs": organs})
 }
 
-// GET /distribution_neomer_16?cancerType=...
-// Returns [{ donor_count:int, num_nullomers:int }, …] for that cancer type.
-func getDistNeomer16Data(c *gin.Context) {
+// GET /distribution_neomer/:K/data_by_cancer_type?cancerType=...
+// Returns [{ donor_count:int, num_nullomers:int }, …] for a specific cancer type and K.
+func getDistNeomerKDataByCancerType(c *gin.Context) {
+    K := c.Param("K")
+    if _, err := strconv.Atoi(K); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter K must be an integer"})
+        return
+    }
     ct := c.Query("cancerType")
     if ct == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing cancerType parameter"})
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing cancerType query parameter"})
         return
     }
 
@@ -1715,22 +1749,24 @@ func getDistNeomer16Data(c *gin.Context) {
     }
     defer db.Close()
 
-    stmt := `
+    tableName := fmt.Sprintf("distribution_neomer_%s_per_cancer", K)
+    stmt := fmt.Sprintf(`
       SELECT donor_count, num_nullomers
-      FROM distribution_neomer_16_per_cancer
+      FROM %s
       WHERE Cancer_Type = ?
       ORDER BY donor_count
-    `
+    `, tableName)
+
     rows, err := db.Query(stmt, ct)
     if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Query failed, possibly no data for K=%s: %v", K, err)})
         return
     }
     defer rows.Close()
 
     type bucket struct {
-        DonorCount    int64 `json:"donorCount"`
-        NumNullomers  int64 `json:"numNullomers"`
+        DonorCount   int64 `json:"donorCount"`
+        NumNullomers int64 `json:"numNullomers"`
     }
     var data []bucket
     for rows.Next() {
@@ -1742,17 +1778,23 @@ func getDistNeomer16Data(c *gin.Context) {
         data = append(data, b)
     }
     c.JSON(http.StatusOK, gin.H{
-        "cancerType": ct,
+        "K":            K,
+        "cancerType":   ct,
         "distribution": data,
     })
 }
 
-// GET /distribution_neomer_16?organs=...
-// Returns [{ donor_count:int, num_nullomers:int }, …] for that cancer type.
-func getDistNeomer16DataOrgans(c *gin.Context) {
-    o := c.Query("organ")
-    if o == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing organ parameter"})
+// GET /distribution_neomer/:K/data_by_organ?organ=...
+// Returns [{ donor_count:int, num_nullomers:int }, …] for a specific organ and K.
+func getDistNeomerKDataByOrgan(c *gin.Context) {
+    K := c.Param("K")
+    if _, err := strconv.Atoi(K); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter K must be an integer"})
+        return
+    }
+    organ := c.Query("organ")
+    if organ == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing organ query parameter"})
         return
     }
 
@@ -1764,22 +1806,24 @@ func getDistNeomer16DataOrgans(c *gin.Context) {
     }
     defer db.Close()
 
-    stmt := `
+    tableName := fmt.Sprintf("distribution_neomer_%s_per_organ", K)
+    stmt := fmt.Sprintf(`
       SELECT donor_count, num_nullomers
-      FROM distribution_neomer_16_per_organ
+      FROM %s
       WHERE Organ = ?
       ORDER BY donor_count
-    `
-    rows, err := db.Query(stmt, o)
+    `, tableName)
+
+    rows, err := db.Query(stmt, organ)
     if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Query failed, possibly no data for K=%s: %v", K, err)})
         return
     }
     defer rows.Close()
 
     type bucket struct {
-        DonorCount    int64 `json:"donorCount"`
-        NumNullomers  int64 `json:"numNullomers"`
+        DonorCount   int64 `json:"donorCount"`
+        NumNullomers int64 `json:"numNullomers"`
     }
     var data []bucket
     for rows.Next() {
@@ -1791,11 +1835,11 @@ func getDistNeomer16DataOrgans(c *gin.Context) {
         data = append(data, b)
     }
     c.JSON(http.StatusOK, gin.H{
-        "Organ": o,
+        "K":            K,
+        "organ":        organ,
         "distribution": data,
     })
 }
-
 
 // GET /exome_patient_details?donor_id=…
 func getExomePatientDetailsHandler(c *gin.Context) {
