@@ -1198,108 +1198,139 @@ func getPatientNeomersHandler(c *gin.Context) {
 // ------------------------------------------------------------------
 
 func analyzeNeomerHandler(c *gin.Context) {
-    neomer := c.Query("neomer")
-    if neomer == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing neomer parameter"})
-        return
-    }
-    K := len(neomer)
-    if K < 11 || K > 20 {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Neomer length must be between 11 and 20"})
-        return
-    }
+	neomer := c.Query("neomer")
+	if neomer == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing neomer parameter"})
+		return
+	}
+	K := len(neomer)
+	if K < 11 || K > 20 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Neomer length must be between 11 and 20"})
+		return
+	}
 
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
+	db, err := sql.Open("duckdb", getDatabasePath())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open database: " + err.Error()})
+		return
+	}
+	defer db.Close()
 
-    tableName := fmt.Sprintf("neomers_%d", K)
+	tableName := fmt.Sprintf("neomers_%d", K)
 
-    // —— First query: overall stats —— 
-    totalQuery := fmt.Sprintf(`
-        SELECT
-            COUNT(*)                          AS total_count,
-            COUNT(DISTINCT di.Actual_Donor_ID) AS distinct_donors,
-            COUNT(DISTINCT c.Cancer_Type)     AS distinct_cancer_types,
-            COUNT(DISTINCT c.Organ)           AS distinct_organs
-        FROM %s n
-        JOIN cancer_type_details c         USING (Project_Code)
-        JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-        JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id
-        WHERE n.nullomers_created = ?
-    `, tableName)
+	// —— First query: overall stats ——
+	totalQuery := fmt.Sprintf(`
+		SELECT
+			COUNT(*)                          AS total_count,
+			COUNT(DISTINCT di.Actual_Donor_ID) AS distinct_donors,
+			COUNT(DISTINCT c.Cancer_Type)     AS distinct_cancer_types,
+			COUNT(DISTINCT c.Organ)           AS distinct_organs
+		FROM %s n
+		JOIN cancer_type_details c         USING (Project_Code)
+		JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+		/* JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id -- Not needed for these counts */
+		WHERE n.nullomers_created = ?
+	`, tableName)
 
-    var totalCount, distinctDonors, distinctCancerTypes, distinctOrgans int
-    if err := db.QueryRow(totalQuery, neomer).Scan(
-        &totalCount, &distinctDonors, &distinctCancerTypes, &distinctOrgans,
-    ); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
+	var totalCount, distinctDonors, distinctCancerTypes, distinctOrgans int
+	if err := db.QueryRow(totalQuery, neomer).Scan(
+		&totalCount, &distinctDonors, &distinctCancerTypes, &distinctOrgans,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching total stats: " + err.Error()})
+		return
+	}
 
-    // —— Second query: breakdown —— 
-    breakdownQuery := fmt.Sprintf(`
-        SELECT
-            c.Cancer_Type,
-            c.Organ,
-            COUNT(*) AS count
-        FROM %s n
-        JOIN cancer_type_details c         USING (Project_Code)
-        JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
-        JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id
-        WHERE n.nullomers_created = ?
-        GROUP BY c.Cancer_Type, c.Organ
-    `, tableName)
+	// —— Second query: breakdown ——
+	breakdownQuery := fmt.Sprintf(`
+		SELECT
+			c.Cancer_Type,
+			c.Organ,
+			COUNT(*) AS count
+		FROM %s n
+		JOIN cancer_type_details c         USING (Project_Code)
+		JOIN donor_id_mapping   di        ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+		/* JOIN donor_data         d         ON di.Actual_Donor_ID = d.icgc_donor_id -- Not needed for this breakdown */
+		WHERE n.nullomers_created = ?
+		GROUP BY c.Cancer_Type, c.Organ
+	`, tableName)
 
-    rows, err := db.Query(breakdownQuery, neomer)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer rows.Close()
+	rows, err := db.Query(breakdownQuery, neomer)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching breakdown stats: " + err.Error()})
+		return
+	}
+	defer rows.Close()
 
-    type OrganCount struct {
-        Organ string `json:"organ"`
-        Count int    `json:"count"`
-    }
-    type CancerTypeCount struct {
-        CancerType string       `json:"cancerType"`
-        Count      int          `json:"count"`
-        Organs     []OrganCount `json:"organs"`
-    }
+	type OrganCount struct {
+		Organ string `json:"organ"`
+		Count int    `json:"count"`
+	}
+	type CancerTypeCount struct {
+		CancerType string       `json:"cancerType"`
+		Count      int          `json:"count"`
+		Organs     []OrganCount `json:"organs"`
+	}
 
-    cancerMap := make(map[string]*CancerTypeCount)
-    for rows.Next() {
-        var ct, organ string
-        var cnt int
-        if err := rows.Scan(&ct, &organ, &cnt); err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-            return
-        }
-        if _, ok := cancerMap[ct]; !ok {
-            cancerMap[ct] = &CancerTypeCount{CancerType: ct}
-        }
-        cancerMap[ct].Count += cnt
-        cancerMap[ct].Organs = append(cancerMap[ct].Organs, OrganCount{Organ: organ, Count: cnt})
-    }
+	cancerMap := make(map[string]*CancerTypeCount)
+	for rows.Next() {
+		var ct, organ string
+		var cnt int
+		if err := rows.Scan(&ct, &organ, &cnt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error scanning breakdown row: " + err.Error()})
+			return
+		}
+		if _, ok := cancerMap[ct]; !ok {
+			cancerMap[ct] = &CancerTypeCount{CancerType: ct}
+		}
+		cancerMap[ct].Count += cnt
+		cancerMap[ct].Organs = append(cancerMap[ct].Organs, OrganCount{Organ: organ, Count: cnt})
+	}
 
-    var breakdown []CancerTypeCount
-    for _, v := range cancerMap {
-        breakdown = append(breakdown, *v)
-    }
+	var breakdown []CancerTypeCount
+	for _, v := range cancerMap {
+		breakdown = append(breakdown, *v)
+	}
 
-    c.JSON(http.StatusOK, gin.H{
-        "analysis": map[string]interface{}{
-            "totalNeomers":        totalCount,
-            "distinctDonors":      distinctDonors,
-            "distinctCancerTypes": distinctCancerTypes,
-            "distinctOrgans":      distinctOrgans,
-            "cancerBreakdown":     breakdown,
-        },
-    })
+	// —— Third query: distinct actual donor IDs ——
+	distinctDonorIDsQuery := fmt.Sprintf(`
+		SELECT DISTINCT di.Actual_Donor_ID
+		FROM %s n
+		JOIN donor_id_mapping di ON CAST(n."Donor_ID" AS INT) = di."Donor_ID"
+		WHERE n.nullomers_created = ?
+	`, tableName)
+
+	donorRows, err := db.Query(distinctDonorIDsQuery, neomer)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching distinct donor IDs: " + err.Error()})
+		return
+	}
+	defer donorRows.Close()
+
+	var distinctDonorIDsList []string
+	for donorRows.Next() {
+		var actualDonorID string
+		if err := donorRows.Scan(&actualDonorID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error scanning distinct donor ID row: " + err.Error()})
+			return
+		}
+		distinctDonorIDsList = append(distinctDonorIDsList, actualDonorID)
+	}
+	if err := donorRows.Err(); err != nil { // Check for errors during iteration
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating distinct donor IDs: " + err.Error()})
+		return
+	}
+
+
+	c.JSON(http.StatusOK, gin.H{
+		"analysis": map[string]interface{}{
+			"totalNeomers":        totalCount,
+			"distinctDonors":      distinctDonors, // This is count of distinct Actual_Donor_ID
+			"distinctCancerTypes": distinctCancerTypes,
+			"distinctOrgans":      distinctOrgans,
+			"cancerBreakdown":     breakdown,
+			"distinctDonorIDs":    distinctDonorIDsList, // Added this list
+		},
+	})
 }
 
 
@@ -1984,95 +2015,140 @@ func getExomePatientNeomersHandler(c *gin.Context) {
 }
 
 
-// GET /exome_analyze_neomer?neomer=XYZ
 func getExomeAnalyzeNeomerHandler(c *gin.Context) {
-    neomer := c.Query("neomer")
-    if neomer == "" {
-      c.JSON(http.StatusBadRequest, gin.H{"error": "Missing neomer"})
-      return
-    }
-    // infer length from string
-    length := len([]rune(neomer))
-    tableName := fmt.Sprintf("exome_neomers_%d", length)
-  
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-      c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-      return
-    }
-    defer db.Close()
-  
-    // 1) Cancer Type breakdown
-    cancerQ := fmt.Sprintf(`
-      SELECT d.Cancer_Type    AS cancerType,
-             COUNT(DISTINCT di.Donor_ID) AS count
-      FROM %s AS n
-      JOIN exomes_donor_id_mapping AS di
-        ON n.Donor_ID = di.Donor_ID
-      JOIN exome_donor_data AS d
-        ON di.Actual_Donor_ID = d.bcr_patient_barcode
-      WHERE n.nullomers_created = ?
-      GROUP BY d.Cancer_Type
-      ORDER BY count DESC
-    `, tableName)
-  
-    cancerRows, err := db.Query(cancerQ, neomer)
-    if err != nil {
-      c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-      return
-    }
-    defer cancerRows.Close()
-  
-    var cancerBreakdown []map[string]interface{}
-    for cancerRows.Next() {
-      var ct string
-      var cnt int
-      if err := cancerRows.Scan(&ct, &cnt); err == nil {
-        cancerBreakdown = append(cancerBreakdown, map[string]interface{}{
-          "cancerType": ct,
-          "count":      cnt,
-        })
-      }
-    }
-  
-    // 2) Organ breakdown
-    organQ := fmt.Sprintf(`
-      SELECT d.Organ         AS organ,
-             COUNT(DISTINCT di.Donor_ID) AS count
-      FROM %s AS n
-      JOIN exomes_donor_id_mapping AS di
-        ON n.Donor_ID = di.Donor_ID
-      JOIN exome_donor_data AS d
-        ON di.Actual_Donor_ID = d.bcr_patient_barcode
-      WHERE n.nullomers_created = ?
-      GROUP BY d.Organ
-      ORDER BY count DESC
-    `, tableName)
-  
-    organRows, err := db.Query(organQ, neomer)
-    if err != nil {
-      c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-      return
-    }
-    defer organRows.Close()
-  
-    var organBreakdown []map[string]interface{}
-    for organRows.Next() {
-      var org string
-      var cnt int
-      if err := organRows.Scan(&org, &cnt); err == nil {
-        organBreakdown = append(organBreakdown, map[string]interface{}{
-          "organ": org,
-          "count": cnt,
-        })
-      }
-    }
-  
-    c.JSON(http.StatusOK, gin.H{
-      "analysis": gin.H{
-        "cancerBreakdown": cancerBreakdown,
-        "organBreakdown":  organBreakdown,
-      },
-    })
-  }
+	neomer := c.Query("neomer")
+	if neomer == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing neomer"})
+		return
+	}
+	length := len([]rune(neomer))
+	
+	tableName := fmt.Sprintf("exome_neomers_%d", length)
+
+	db, err := sql.Open("duckdb", getDatabasePath())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open database: " + err.Error()})
+		return
+	}
+	defer db.Close()
+
+	// 1) Cancer Type breakdown
+	cancerQ := fmt.Sprintf(`
+		SELECT d.Cancer_Type    AS cancerType,
+			   COUNT(DISTINCT di.Actual_Donor_ID) AS count -- Count distinct actual donors for cancer type
+		FROM %s AS n
+		JOIN exomes_donor_id_mapping AS di
+			ON n.Donor_ID = di.Donor_ID
+		JOIN exome_donor_data AS d
+			ON di.Actual_Donor_ID = d.bcr_patient_barcode
+		WHERE n.nullomers_created = ?
+		GROUP BY d.Cancer_Type
+		ORDER BY count DESC
+	`, tableName)
+
+	cancerRows, err := db.Query(cancerQ, neomer)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching cancer breakdown: " + err.Error()})
+		return
+	}
+	defer cancerRows.Close()
+
+	var cancerBreakdown []map[string]interface{}
+	for cancerRows.Next() {
+		var ct string
+		var cnt int
+		if err := cancerRows.Scan(&ct, &cnt); err == nil {
+			cancerBreakdown = append(cancerBreakdown, map[string]interface{}{
+				"cancerType": ct,
+				"count":      cnt,
+			})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error scanning cancer breakdown row: " + err.Error()})
+			return
+		}
+	}
+	if err := cancerRows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating cancer breakdown: " + err.Error()})
+		return
+	}
+
+	// 2) Organ breakdown
+	organQ := fmt.Sprintf(`
+		SELECT d.Organ         AS organ,
+			   COUNT(DISTINCT di.Actual_Donor_ID) AS count -- Count distinct actual donors for organ
+		FROM %s AS n
+		JOIN exomes_donor_id_mapping AS di
+			ON n.Donor_ID = di.Donor_ID
+		JOIN exome_donor_data AS d
+			ON di.Actual_Donor_ID = d.bcr_patient_barcode
+		WHERE n.nullomers_created = ?
+		GROUP BY d.Organ
+		ORDER BY count DESC
+	`, tableName)
+
+	organRows, err := db.Query(organQ, neomer)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching organ breakdown: " + err.Error()})
+		return
+	}
+	defer organRows.Close()
+
+	var organBreakdown []map[string]interface{}
+	for organRows.Next() {
+		var org string
+		var cnt int
+		if err := organRows.Scan(&org, &cnt); err == nil {
+			organBreakdown = append(organBreakdown, map[string]interface{}{
+				"organ": org,
+				"count": cnt,
+			})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error scanning organ breakdown row: " + err.Error()})
+			return
+		}
+	}
+	if err := organRows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating organ breakdown: " + err.Error()})
+		return
+	}
+
+	// 3) Distinct Actual Donor IDs List
+	distinctDonorIDsQueryExome := fmt.Sprintf(`
+		SELECT DISTINCT di.Actual_Donor_ID
+		FROM %s AS n
+		JOIN exomes_donor_id_mapping AS di ON n.Donor_ID = di.Donor_ID
+		WHERE n.nullomers_created = ?
+	`, tableName)
+
+	exomeDonorRows, err := db.Query(distinctDonorIDsQueryExome, neomer)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching distinct exome donor IDs: " + err.Error()})
+		return
+	}
+	defer exomeDonorRows.Close()
+
+	var distinctExomeDonorIDsList []string
+	for exomeDonorRows.Next() {
+		var actualDonorID string
+		if err := exomeDonorRows.Scan(&actualDonorID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error scanning distinct exome donor ID row: " + err.Error()})
+			return
+		}
+		distinctExomeDonorIDsList = append(distinctExomeDonorIDsList, actualDonorID)
+	}
+	if err := exomeDonorRows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating distinct exome donor IDs: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"analysis": gin.H{
+			"cancerBreakdown":  cancerBreakdown,
+			"organBreakdown":   organBreakdown,
+			"distinctDonorIDs": distinctExomeDonorIDsList, // Added this list
+		},
+	})
+}
+
+
   
