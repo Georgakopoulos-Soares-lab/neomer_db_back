@@ -12,6 +12,7 @@ import (
     "github.com/gin-gonic/gin"
     _ "github.com/marcboeker/go-duckdb"
     "github.com/gin-contrib/cors"
+    "time"
 )
 
 func main() {
