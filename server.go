@@ -11,13 +11,21 @@ import (
     "regexp"
     "github.com/gin-gonic/gin"
     _ "github.com/marcboeker/go-duckdb"
+    "github.com/gin-contrib/cors"
 )
 
 func main() {
     router := gin.Default()
 
     // Disable CORS policy
-    router.Use(corsMiddleware())
+        router.Use(cors.New(cors.Config{
+                AllowOrigins:     []string{"*"},
+                AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+                AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+                ExposeHeaders:    []string{"Content-Length"},
+                AllowCredentials: true,
+                MaxAge:           12 * time.Hour,
+        }))
 
     router.GET("/healthcheck", healthCheckHandler)
     router.GET("/cancer_types", makeHandler("SELECT * FROM cancer_types"))
