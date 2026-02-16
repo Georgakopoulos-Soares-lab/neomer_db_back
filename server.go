@@ -993,6 +993,7 @@ func getPatientDetailsHandler(c *gin.Context) {
 
     // 2) Map Actual_Donor_ID → internal Donor_ID
     var internalID int
+    var err error
     err = db.QueryRow(`
         SELECT Donor_ID 
         FROM donor_id_mapping 
