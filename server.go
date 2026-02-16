@@ -15,7 +15,25 @@ import (
     "time"
 )
 
+// Global database connection
+var db *sql.DB
+
 func main() {
+    // Initialize global database connection once
+    var err error
+    db, err = sql.Open("duckdb", getDatabasePath())
+    if err != nil {
+        log.Fatalf("Failed to open database: %v", err)
+    }
+    defer db.Close()
+
+    // Apply resource limits to prevent VM freezing
+    _, err = db.Exec("SET memory_limit = '8GB'; SET threads = 3; SET temp_directory = '/tmp/duckdb_temp'; SET preserve_insertion_order = false;")
+    if err != nil {
+        log.Fatalf("Failed to set database resource limits: %v", err)
+    }
+
+    log.Println("Database initialized with resource limits: memory_limit=8GB, threads=3")
     router := gin.Default()
 
     // Disable CORS policy
@@ -90,14 +108,6 @@ func healthCheckHandler(c *gin.Context) {
 
 func makeHandler(query string) func(*gin.Context) {
     return func(c *gin.Context) {
-        dbPath := getDatabasePath()
-        db, err := sql.Open("duckdb", dbPath)
-        if err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-            return
-        }
-        defer db.Close()
-
         rows, err := db.Query(query)
         if err != nil {
             c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -193,13 +203,6 @@ func getNullomersHandler(c *gin.Context) {
     if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 10000 {
         limit = l
     }
-
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     // 1) Base CTE
     baseQuery := fmt.Sprintf(`
@@ -426,14 +429,6 @@ func getSuggestionsHandler(c *gin.Context) {
 		return
 	}
 
-	dbPath := getDatabasePath()
-	db, err := sql.Open("duckdb", dbPath)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer db.Close()
-
 	lowerInput := strings.ToLower(input)
 	var whereClause string
 	if lowerInput != "" {
@@ -506,13 +501,6 @@ func getNullomersStatsHandler(c *gin.Context) {
     if n, err := strconv.Atoi(topNStr); err == nil && n > 0 {
         topN = n
     }
-
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     // Base CTE
     baseCTE := fmt.Sprintf(`
@@ -746,13 +734,6 @@ WITH base AS (
     // 2) Total count
     countQ := baseCTE + "SELECT COUNT(*) FROM base" + finalWhere
 
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
     var totalCount int
     if err := db.QueryRow(countQ).Scan(&totalCount); err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -816,13 +797,6 @@ func getExomeSuggestionsHandler(c *gin.Context) {
         c.JSON(http.StatusOK, gin.H{"suggestions": []string{}})
         return
     }
-
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     lowerInput := strings.ToLower(input)
     cond := ""
@@ -966,13 +940,6 @@ WITH base AS (
             selectClause, finalWhere, groupByClause, topN,
         )
 
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
     rows, err := db.Query(statsQ)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1023,13 +990,6 @@ func getPatientDetailsHandler(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing donor_id"})
         return
     }
-
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     // 2) Map Actual_Donor_ID → internal Donor_ID
     var internalID int
@@ -1137,12 +1097,6 @@ func getPatientNeomersHandler(c *gin.Context) {
         }
     }
 
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     tableName := fmt.Sprintf("neomers_%d", length)
 
@@ -1217,13 +1171,6 @@ func analyzeNeomerHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Neomer length must be between 11 and 20"})
 		return
 	}
-
-	db, err := sql.Open("duckdb", getDatabasePath())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open database: " + err.Error()})
-		return
-	}
-	defer db.Close()
 
 	tableName := fmt.Sprintf("neomers_%d", K)
 
@@ -1367,16 +1314,6 @@ func getJaccardIndexHandler(c *gin.Context) {
     // Construct the table name safely
     tableName := fmt.Sprintf("neomers_%s", K)
 
-    // Open the database connection
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        log.Printf("Error opening database: %v", err)
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection failed"})
-        return
-    }
-    defer db.Close()
-
     // Define the SQL query to compute Jaccard indices for all pairs,
     //  (though for Jaccard across cancer types,
     // the main references remain nullomers + cancer_type_details).
@@ -1508,16 +1445,6 @@ func getJaccardIndexOrgansHandler(c *gin.Context) {
     // Construct the table name safely
     tableName := fmt.Sprintf("neomers_%s", K)
 
-    // Open the database connection
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        log.Printf("Error opening database: %v", err)
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection failed"})
-        return
-    }
-    defer db.Close()
-
     // Define the SQL query to compute Jaccard indices for all pairs,
     // (though for Jaccard across organs
     // the main references remain nullomers + cancer_type_details).
@@ -1627,21 +1554,9 @@ func getJaccardIndexOrgansHandler(c *gin.Context) {
 
 
 func getDatasetStatsCancerTypesVaryingKHandler(c *gin.Context){
-    
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
     lower_k := 11
     upper_k := 16
     all_results := map[string]interface{}{}
-
-
-    
 
     for i := lower_k; i <= upper_k; i++ {
         tableName := fmt.Sprintf("neomers_%d", i)
@@ -1689,14 +1604,6 @@ func getDistNeomerKCancerTypes(c *gin.Context) {
         return
     }
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
     tableName := fmt.Sprintf("distribution_neomer_%s_per_cancer", K)
     query := fmt.Sprintf(`
         SELECT DISTINCT Cancer_Type
@@ -1732,14 +1639,6 @@ func getDistNeomerKOrgans(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Parameter K must be an integer"})
         return
     }
-
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     tableName := fmt.Sprintf("distribution_neomer_%s_per_organ", K)
     query := fmt.Sprintf(`
@@ -1780,14 +1679,6 @@ func getDistNeomerKDataByCancerType(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing cancerType query parameter"})
         return
     }
-
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     tableName := fmt.Sprintf("distribution_neomer_%s_per_cancer", K)
     stmt := fmt.Sprintf(`
@@ -1838,14 +1729,6 @@ func getDistNeomerKDataByOrgan(c *gin.Context) {
         return
     }
 
-    dbPath := getDatabasePath()
-    db, err := sql.Open("duckdb", dbPath)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
     tableName := fmt.Sprintf("distribution_neomer_%s_per_organ", K)
     stmt := fmt.Sprintf(`
       SELECT donor_count, num_nullomers
@@ -1888,13 +1771,6 @@ func getExomePatientDetailsHandler(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Missing donor_id"})
         return
     }
-
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
 
     // 1) Grab the column names dynamically
     cols, err := db.Query(`SELECT * FROM exome_donor_data LIMIT 0`)
@@ -1969,13 +1845,6 @@ func getExomePatientNeomersHandler(c *gin.Context) {
         }
     }
 
-    db, err := sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer db.Close()
-
     tableName := fmt.Sprintf("exome_neomers_%d", length)
 
     // build the base query
@@ -2033,13 +1902,6 @@ func getExomeAnalyzeNeomerHandler(c *gin.Context) {
 	length := len([]rune(neomer))
 	
 	tableName := fmt.Sprintf("exome_neomers_%d", length)
-
-	db, err := sql.Open("duckdb", getDatabasePath())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open database: " + err.Error()})
-		return
-	}
-	defer db.Close()
 
 	// 1) Cancer Type breakdown
 	cancerQ := fmt.Sprintf(`
