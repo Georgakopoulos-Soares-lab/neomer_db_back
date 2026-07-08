@@ -9,7 +9,7 @@ Set `NEOMERS_DUCK_DB_FILE` to the absolute path of the DuckDB database file insi
 If you use a Railway volume, mount it at `/data` and place the database at:
 
 ```text
-/data/staging.neomers.ddb
+/neomer_data/staging.neomers.ddb
 ```
 
 That path is already configured as the Docker default and can be overridden in Railway.

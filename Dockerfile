@@ -19,7 +19,7 @@ WORKDIR /app
 COPY --from=builder /out/neomer_server ./neomer_server
 
 ENV GIN_MODE=release \
-    NEOMERS_DUCK_DB_FILE=/data/staging.neomers.ddb
+    NEOMERS_DUCK_DB_FILE=/neomer_data/staging.neomers.ddb
 
 EXPOSE 8080
 
