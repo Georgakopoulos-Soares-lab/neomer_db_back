@@ -17,23 +17,18 @@ import (
 
 // Global database connection
 var db *sql.DB
+var dbInitErr error
 
 func main() {
     // Initialize global database connection once
-    var err error
-    db, err = sql.Open("duckdb", getDatabasePath())
-    if err != nil {
-        log.Fatalf("Failed to open database: %v", err)
-    }
-    defer db.Close()
-
-    // Apply resource limits to prevent VM freezing
-    _, err = db.Exec("SET memory_limit = '8GB'; SET threads = 3; SET temp_directory = '/tmp/duckdb_temp'; SET preserve_insertion_order = false;")
-    if err != nil {
-        log.Fatalf("Failed to set database resource limits: %v", err)
+    dbInitErr = initializeDatabase()
+    if dbInitErr != nil {
+        log.Printf("Database unavailable: %v", dbInitErr)
+    } else {
+        defer db.Close()
+        log.Println("Database initialized with resource limits: memory_limit=8GB, threads=3")
     }
 
-    log.Println("Database initialized with resource limits: memory_limit=8GB, threads=3")
     router := gin.Default()
 
     // Disable CORS policy
@@ -47,6 +42,7 @@ func main() {
         }))
 
     router.GET("/healthcheck", healthCheckHandler)
+    router.Use(requireDatabase())
     router.GET("/cancer_types", makeHandler("SELECT * FROM cancer_types"))
     router.GET("/donor_data", makeHandler("SELECT * FROM donor_data"))
     router.GET("/exomes_donor_data", makeHandler("SELECT * FROM exome_donor_data"))
@@ -103,7 +99,51 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 func healthCheckHandler(c *gin.Context) {
-    c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+    if dbInitErr != nil {
+        c.JSON(http.StatusOK, gin.H{"status": "healthy", "database": "unavailable", "error": dbInitErr.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"status": "healthy", "database": "available"})
+}
+
+func initializeDatabase() error {
+    databasePath := getDatabasePath()
+    if _, err := os.Stat(databasePath); err != nil {
+        if os.IsNotExist(err) {
+            return fmt.Errorf("database file not found: %s", databasePath)
+        }
+        return fmt.Errorf("failed to access database file %s: %w", databasePath, err)
+    }
+
+    var err error
+    db, err = sql.Open("duckdb", databasePath)
+    if err != nil {
+        return fmt.Errorf("failed to open database: %w", err)
+    }
+
+    // Apply resource limits to prevent VM freezing
+    _, err = db.Exec("SET memory_limit = '8GB'; SET threads = 3; SET temp_directory = '/tmp/duckdb_temp'; SET preserve_insertion_order = false;")
+    if err != nil {
+        db.Close()
+        db = nil
+        return fmt.Errorf("failed to set database resource limits: %w", err)
+    }
+
+    return nil
+}
+
+func requireDatabase() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        if dbInitErr != nil || db == nil {
+            message := "database is unavailable"
+            if dbInitErr != nil {
+                message = dbInitErr.Error()
+            }
+            c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": message})
+            return
+        }
+        c.Next()
+    }
 }
 
 func makeHandler(query string) func(*gin.Context) {
